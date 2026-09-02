@@ -19,6 +19,7 @@ from .pipeline import DATA_DIR, LOG_DIR, delete_session, load_session, preserve_
 
 API_BASE = "https://api.telegram.org"
 HEALTH_CHECK_INTERVAL = 24 * 3600
+LONG_POLL_SECONDS = 25  # Telegram allows up to 50; fewer new connections, no added latency
 RETRY_ATTEMPTS = 4
 RETRY_DELAY = 1.5
 
@@ -64,7 +65,6 @@ def run(token: str, data_dir: Path = DATA_DIR) -> None:
             except Exception:
                 log.exception("handle_update failed for update_id=%s", update.get("update_id"))
                 notify_failure(token, update)
-        time.sleep(0.2)
 
 
 def health_check(token: str) -> list[doctor.Check]:
@@ -81,7 +81,23 @@ def health_check(token: str) -> list[doctor.Check]:
             log.exception("failed to send health alert")
     if not failed:
         log.info("health check ok")
+        retry_pending_and_report(token, alert_chat_id)
     return failed
+
+
+def retry_pending_and_report(token: str, alert_chat_id: Optional[str]) -> None:
+    if not any(pipeline.PENDING_CONTACT_DIR.glob("*.json")):
+        return
+    saved, failures = pipeline.retry_pending()
+    log.info("pending retry: saved=%d failed=%d", saved, len(failures))
+    if alert_chat_id and (saved or failures):
+        text = f"보류 연락처 재시도: 저장 {saved}건, 실패 {len(failures)}건"
+        if failures:
+            text += "\n- " + "\n- ".join(failures[:5])
+        try:
+            send_message(token, int(alert_chat_id), text)
+        except Exception:
+            log.exception("failed to report pending retry")
 
 
 def notify_failure(token: str, update: dict) -> None:
@@ -213,10 +229,10 @@ def save_largest_photo(token: str, photos: list, chat_id: int, data_dir: Path, s
 
 
 def get_updates(token: str, offset: Optional[int] = None) -> list:
-    params = {"timeout": 3, "allowed_updates": json.dumps(["message", "callback_query"])}
+    params = {"timeout": LONG_POLL_SECONDS, "allowed_updates": json.dumps(["message", "callback_query"])}
     if offset is not None:
         params["offset"] = offset
-    return api_get(token, "getUpdates", params)["result"]
+    return api_get(token, "getUpdates", params, timeout=LONG_POLL_SECONDS + 10)["result"]
 
 
 def send_status(token: str, chat_id: int, text: str) -> int:
@@ -298,9 +314,9 @@ def with_retry(call, label: str, attempts: int = RETRY_ATTEMPTS):
             time.sleep(RETRY_DELAY * attempt)
 
 
-def api_get(token: str, method: str, params: Optional[dict] = None) -> dict:
+def api_get(token: str, method: str, params: Optional[dict] = None, timeout: int = 10) -> dict:
     def call() -> dict:
-        with urlopen(method_url(token, method, params), timeout=10) as response:
+        with urlopen(method_url(token, method, params), timeout=timeout) as response:
             return json.loads(response.read().decode("utf-8"))
 
     payload = with_retry(call, f"Telegram {method}")
@@ -355,6 +371,7 @@ def setup_logging() -> None:
         file_handler = logging.handlers.RotatingFileHandler(LOG_DIR / "bot.log", maxBytes=2_000_000, backupCount=3, encoding="utf-8")
         file_handler.setFormatter(formatter)
         log.addHandler(file_handler)
+        stream.setLevel(logging.WARNING)  # bot.log rotates; launchd's stderr file does not
     except OSError:
         log.warning("could not open log file; continuing with stderr only")
 

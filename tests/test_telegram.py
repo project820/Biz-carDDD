@@ -141,6 +141,33 @@ class TelegramTest(unittest.TestCase):
             with self.assertRaises(URLError):
                 telegram.with_retry(lambda: (_ for _ in ()).throw(URLError("down")), "y")
 
+    def test_get_updates_uses_long_polling(self):
+        seen = {}
+
+        def fake_api_get(token, method, params=None, timeout=10):
+            seen.update(params or {})
+            seen["timeout_arg"] = timeout
+            return {"result": []}
+
+        with patch.object(telegram, "api_get", fake_api_get):
+            telegram.get_updates("token", 5)
+        self.assertEqual(seen["timeout"], telegram.LONG_POLL_SECONDS)
+        self.assertGreater(seen["timeout_arg"], telegram.LONG_POLL_SECONDS)
+        self.assertEqual(seen["offset"], 5)
+
+    def test_health_check_retries_pending_queue_when_healthy(self):
+        sent, calls = [], []
+        with tempfile.TemporaryDirectory() as tmp, patch.object(pipeline, "PENDING_CONTACT_DIR", Path(tmp)), patch.object(
+            doctor, "run_checks", lambda names=None: [doctor.Check("gws", True, "ok")]
+        ), patch.object(pipeline, "retry_pending", lambda: calls.append(1) or (1, [])), patch.dict(
+            os.environ, {"BIZCARD_ALERT_CHAT_ID": "42"}
+        ), patch.object(telegram, "send_message", fake_send_message(sent)):
+            telegram.health_check("token")  # queue empty: no retry
+            (Path(tmp) / "x.json").write_text("{}")
+            telegram.health_check("token")
+        self.assertEqual(len(calls), 1)
+        self.assertIn("저장 1건", sent[-1][0])
+
 
 if __name__ == "__main__":
     unittest.main()
