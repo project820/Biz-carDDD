@@ -124,6 +124,23 @@ class TelegramTest(unittest.TestCase):
         self.assertIn("Google 인증 무효", sent[0][0])
         self.assertIn("gws auth login", sent[0][0])
 
+    def test_api_calls_retry_transient_network_errors(self):
+        from urllib.error import URLError
+
+        attempts = []
+
+        def flaky():
+            attempts.append(1)
+            if len(attempts) < 3:
+                raise URLError("Connection reset by peer")
+            return {"ok": True}
+
+        with patch.object(telegram.time, "sleep", lambda s: None):
+            self.assertEqual(telegram.with_retry(flaky, "x"), {"ok": True})
+            self.assertEqual(len(attempts), 3)
+            with self.assertRaises(URLError):
+                telegram.with_retry(lambda: (_ for _ in ()).throw(URLError("down")), "y")
+
 
 if __name__ == "__main__":
     unittest.main()
