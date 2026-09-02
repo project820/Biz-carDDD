@@ -1,0 +1,18 @@
+{
+  "type": "object",
+  "properties": {
+    "name": {"type": "string", "description": "이름만 (직책 제외)"},
+    "title": {"type": "string", "description": "직책. 명함에 없으면 '대표'"},
+    "company": {"type": "string"},
+    "mobile": {"type": "array", "items": {"type": "string"}},
+    "work": {"type": "array", "items": {"type": "string"}},
+    "fax": {"type": "array", "items": {"type": "string"}},
+    "email": {"type": "array", "items": {"type": "string"}},
+    "website": {"type": "array", "items": {"type": "string"}},
+    "address": {"type": "array", "items": {"type": "string"}},
+    "notes": {"type": "string", "description": "인증서, 회사 특징, 자격증 등 부수 정보"},
+    "warnings": {"type": "array", "items": {"type": "string"}, "description": "확인이 필요한 항목과 사유"}
+  },
+  "required": ["name", "title", "company", "mobile", "work", "fax", "email", "website", "address", "notes", "warnings"],
+  "additionalProperties": false
+}
