@@ -11,6 +11,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlencode
+from urllib.error import URLError
 from urllib.request import Request, urlopen
 
 from . import doctor, pipeline
@@ -18,6 +19,8 @@ from .pipeline import DATA_DIR, LOG_DIR, delete_session, load_session, preserve_
 
 API_BASE = "https://api.telegram.org"
 HEALTH_CHECK_INTERVAL = 24 * 3600
+RETRY_ATTEMPTS = 4
+RETRY_DELAY = 1.5
 
 log = logging.getLogger("bizcard")
 _rejected_chats: set[int] = set()
@@ -245,8 +248,11 @@ def send_photo(token: str, chat_id: int, image_path: Path, caption: str = "") ->
         headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
         method="POST",
     )
-    with urlopen(request, timeout=20) as response:
-        result = json.loads(response.read().decode("utf-8"))
+    def call() -> dict:
+        with urlopen(request, timeout=20) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    result = with_retry(call, "Telegram sendPhoto")
     if result.get("ok") is not True:
         raise RuntimeError(result.get("description") or "Telegram sendPhoto failed")
 
@@ -280,9 +286,24 @@ def approve_cancel_buttons() -> dict:
     return {"inline_keyboard": [[{"text": "승인", "callback_data": "approve"}, {"text": "취소", "callback_data": "cancel"}]]}
 
 
+def with_retry(call, label: str, attempts: int = RETRY_ATTEMPTS):
+    """Retry transient network failures (connection resets are frequent on some links)."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except (URLError, ConnectionError, TimeoutError, OSError) as exc:
+            if attempt == attempts:
+                raise
+            log.warning("%s failed (%s); retry %d/%d", label, exc, attempt, attempts - 1)
+            time.sleep(RETRY_DELAY * attempt)
+
+
 def api_get(token: str, method: str, params: Optional[dict] = None) -> dict:
-    with urlopen(method_url(token, method, params), timeout=10) as response:
-        payload = json.loads(response.read().decode("utf-8"))
+    def call() -> dict:
+        with urlopen(method_url(token, method, params), timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    payload = with_retry(call, f"Telegram {method}")
     if payload.get("ok") is not True:
         raise RuntimeError(payload.get("description") or f"Telegram {method} failed")
     return payload
@@ -295,8 +316,12 @@ def api_post(token: str, method: str, payload: dict) -> dict:
         headers={"Content-Type": "application/json"},
         method="POST",
     )
-    with urlopen(request, timeout=10) as response:
-        result = json.loads(response.read().decode("utf-8"))
+
+    def call() -> dict:
+        with urlopen(request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    result = with_retry(call, f"Telegram {method}")
     if result.get("ok") is not True:
         raise RuntimeError(result.get("description") or f"Telegram {method} failed")
     return result
@@ -304,8 +329,12 @@ def api_post(token: str, method: str, payload: dict) -> dict:
 
 def download_file(token: str, file_path: str) -> bytes:
     url = f"{API_BASE}/file/bot{quote(token, safe=':')}/{quote(file_path, safe='/')}"
-    with urlopen(url, timeout=20) as response:
-        return response.read()
+
+    def call() -> bytes:
+        with urlopen(url, timeout=20) as response:
+            return response.read()
+
+    return with_retry(call, "Telegram download")
 
 
 def method_url(token: str, method: str, params: Optional[dict] = None) -> str:
