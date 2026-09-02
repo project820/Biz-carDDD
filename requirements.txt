@@ -1,0 +1,3 @@
+numpy>=1.24
+Pillow>=10
+opencv-python>=4.8  # optional: OpenCV rectify fallback when Apple Vision fails
