@@ -62,8 +62,10 @@ the bot tells the `BIZCARD_ALERT_CHAT_ID` chat within a day, failed saves stay
 on hold as cards and are saved automatically after you log in again
 (`python -m bizcard_intake retry-pending` forces it).
 
-Log in from Terminal.app. When macOS asks about the `gws-cli` Keychain item,
-choose "Always Allow".
+Keep the encryption key in a file so every caller (launchd, Terminal, agents)
+can read it: set `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` in `.env` and in your
+shell profile, and log in with the same variable set. A gws run in keychain mode
+that cannot read the key deletes `credentials.enc`.
 
 ## Using the bot
 
@@ -113,7 +115,7 @@ own.
 ### Renaming contacts saved with the old layout
 
 Contacts saved before November 2026 have the company in the family name. Run in
-Terminal.app (not from an agent, see AGENTS.md):
+Terminal:
 
 ```bash
 python3 -m bizcard_intake migrate-names                # preview
