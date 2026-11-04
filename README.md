@@ -135,19 +135,21 @@ small edit to the card so it syncs again, then use "알고 있음으로 표시".
 
 ## Parser and tokens
 
-| Backend | Command | Per card (measured) |
+| Backend | How | Per card |
 |---|---|---|
-| `codex` (default when installed) | `codex exec` in an empty dir with `--ignore-user-config --ignore-rules`, reasoning `low`, JSON asked in the prompt | ~5–6k tokens, ~5 s |
-| `claude` | `claude -p --json-schema --allowedTools Read` | ~15 s; Claude Code's own ~47k system prompt is cached but still counts toward the plan |
+| `openai` (default when an API key is stored) | Responses API, `gpt-6-luna`, reasoning `medium`, strict JSON schema, `store: false` | billed on the OpenAI API account; token counts are logged as `openai model=... tokens in=... out=...` |
+| `codex` | `codex exec` in an empty dir with `--ignore-user-config --ignore-rules`, reasoning `low` | ~5–8k tokens of the ChatGPT plan's Codex allowance |
+| `claude` | `claude -p --json-schema --allowedTools Read` | Claude subscription |
 
-Why the flags matter: a bare `codex exec` loads `~/.codex/AGENTS.md`, project
-rules and plugin instructions on every call (about 12k tokens per card). The
-empty working directory and ignore flags cut that in half. `codex --output-schema`
-is deliberately not used because it triples the token count. The image sent to
-the model is a 1024px copy; the 1600px one is only for Apple Vision OCR.
+The API key is the one stored for the Decisions API (`~/.config/gb-invest/decisions.env`);
+the bot reads only the `OPENAI_API_KEY` line and never logs it. If an API call
+fails (network, quota, rate limit) the same prompt is retried once with the
+codex CLI, then claude. The image sent to the model is a 1024px copy; the 1600px
+one is only for Apple Vision OCR. Typed `항목: 값` edits, saving and retries use no
+model at all.
 
-Set `BIZCARD_PARSER=codex|claude`, `BIZCARD_CODEX_MODEL`, `BIZCARD_CLAUDE_MODEL`
-in `.env`.
+Set `BIZCARD_PARSER=openai|codex|claude`, `BIZCARD_OPENAI_MODEL`,
+`BIZCARD_REASONING_EFFORT`, `BIZCARD_CODEX_MODEL`, `BIZCARD_CLAUDE_MODEL` in `.env`.
 
 ## Run as a launchd service (auto-start, auto-restart)
 

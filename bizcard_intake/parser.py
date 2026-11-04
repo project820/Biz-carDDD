@@ -1,8 +1,10 @@
-"""Business-card parsing through a subscription CLI: codex (default) or claude.
+"""Business-card parsing: OpenAI API (default when a key exists), codex or claude CLI.
 
-Both CLIs are driven headless and return one JSON object matching
-card_schema.json. codex gets the schema in the prompt (its --output-schema flag
-triples the token count); claude uses its native --json-schema flag.
+- openai: Responses API with gpt-6-luna, reasoning effort medium and a strict
+  JSON schema (card_schema.json). Uses the OpenAI API key already stored for the
+  Decisions API. Billed per token on the API account.
+- codex / claude: subscription CLIs driven headless; also the fallback when an
+  API call fails, so a network or quota problem never blocks a card.
 """
 
 from __future__ import annotations
@@ -14,6 +16,9 @@ import re
 import shutil
 import subprocess
 import tempfile
+import base64
+import urllib.error
+import urllib.request
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +28,11 @@ from .vision_ocr import OcrResult
 SCHEMA_PATH = Path(__file__).resolve().parent / "card_schema.json"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 DEFAULT_CLAUDE_MODEL = "haiku"
+DEFAULT_OPENAI_MODEL = "gpt-6-luna"
+DEFAULT_REASONING_EFFORT = "medium"
+OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
+# Same lookup order as the decision skill: process env, then key files.
+OPENAI_KEY_FILES = ("~/.config/openai/credentials.env", "~/.config/gb-invest/decisions.env")
 EXTRA_BIN_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 log = logging.getLogger("bizcard")
@@ -42,9 +52,52 @@ FIELD_GUIDE = (
 
 def backend_name() -> str:
     choice = os.environ.get("BIZCARD_PARSER", "auto").strip().lower()
-    if choice in ("codex", "claude"):
+    if choice in ("openai", "codex", "claude"):
         return choice
+    if openai_api_key():
+        return "openai"
     return "codex" if find_binary("codex") else "claude"
+
+
+def fallback_backend(primary: str) -> Optional[str]:
+    """CLI used when the primary backend fails (only for the API backend)."""
+    if primary != "openai":
+        return None
+    for name in ("codex", "claude"):
+        if find_binary(name):
+            return name
+    return None
+
+
+def openai_api_key() -> str:
+    key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if key:
+        return key
+    files = [os.environ["BIZCARD_OPENAI_ENV_FILE"]] if os.environ.get("BIZCARD_OPENAI_ENV_FILE") else list(OPENAI_KEY_FILES)
+    for name in files:
+        path = Path(name).expanduser()
+        try:
+            text = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        for line in text.splitlines():
+            match = re.match(r"\s*(?:export\s+)?OPENAI_API_KEY\s*=\s*(.*)$", line)
+            if match:
+                value = match.group(1).strip().strip("'").strip('"')
+                if value:
+                    return value
+    return ""
+
+
+def openai_key_source() -> str:
+    if os.environ.get("OPENAI_API_KEY", "").strip():
+        return "OPENAI_API_KEY"
+    files = [os.environ["BIZCARD_OPENAI_ENV_FILE"]] if os.environ.get("BIZCARD_OPENAI_ENV_FILE") else list(OPENAI_KEY_FILES)
+    for name in files:
+        path = Path(name).expanduser()
+        if path.is_file() and "OPENAI_API_KEY" in path.read_text(encoding="utf-8", errors="ignore"):
+            return str(path)
+    return ""
 
 
 def find_binary(name: str) -> Optional[str]:
@@ -101,15 +154,79 @@ def revise_draft(draft: CardDraft, reply: str) -> Optional[CardDraft]:
 
 
 def run_backend(prompt: str, image_path: Optional[Path] = None) -> Optional[dict]:
-    backend = backend_name()
-    try:
-        output = run_codex(prompt, image_path) if backend == "codex" else run_claude(prompt, image_path)
-    except Exception as exc:
-        log.warning("%s parser failed: %s", backend, exc)
-        return None
-    data = extract_json(output)
-    if data is None:
+    primary = backend_name()
+    for backend in [primary] + [b for b in [fallback_backend(primary)] if b]:
+        try:
+            if backend == "openai":
+                return run_openai(prompt, image_path)
+            output = run_codex(prompt, image_path) if backend == "codex" else run_claude(prompt, image_path)
+        except Exception as exc:
+            log.warning("%s parser failed: %s", backend, exc)
+            continue
+        data = extract_json(output)
+        if data is not None:
+            return data
         log.warning("%s parser returned no JSON: %s", backend, (output or "")[-300:])
+    return None
+
+
+def openai_request_body(prompt: str, image_path: Optional[Path]) -> dict:
+    content: list[dict] = [{"type": "input_text", "text": prompt}]
+    if image_path is not None:
+        suffix = Path(image_path).suffix.lower()
+        mime = "image/png" if suffix == ".png" else "image/webp" if suffix == ".webp" else "image/jpeg"
+        encoded = base64.b64encode(Path(image_path).read_bytes()).decode("ascii")
+        content.append({"type": "input_image", "image_url": f"data:{mime};base64,{encoded}"})
+    schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+    return {
+        "model": os.environ.get("BIZCARD_OPENAI_MODEL", DEFAULT_OPENAI_MODEL),
+        "reasoning": {"effort": os.environ.get("BIZCARD_REASONING_EFFORT", DEFAULT_REASONING_EFFORT)},
+        "input": [{"role": "user", "content": content}],
+        "text": {"format": {"type": "json_schema", "name": "business_card", "schema": schema, "strict": True}},
+        "store": False,
+    }
+
+
+def run_openai(prompt: str, image_path: Optional[Path]) -> dict:
+    key = openai_api_key()
+    if not key:
+        raise RuntimeError("OpenAI API key not found")
+    request = urllib.request.Request(
+        OPENAI_RESPONSES_URL,
+        data=json.dumps(openai_request_body(prompt, image_path)).encode("utf-8"),
+        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=parser_timeout()) as response:
+            result = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            message = json.loads(body).get("error", {}).get("message") or body
+        except (json.JSONDecodeError, AttributeError):
+            message = body
+        raise RuntimeError(f"OpenAI HTTP {exc.code}: {message[:300]}") from exc
+    usage = result.get("usage") or {}
+    log.info(
+        "openai model=%s tokens in=%s out=%s reasoning=%s",
+        result.get("model"), usage.get("input_tokens"), usage.get("output_tokens"),
+        (usage.get("output_tokens_details") or {}).get("reasoning_tokens"),
+    )
+    if result.get("status") not in (None, "completed"):
+        raise RuntimeError(f"OpenAI response status={result.get('status')}")
+    texts = [
+        part.get("text", "")
+        for item in result.get("output", [])
+        for part in (item.get("content") or [])
+        if part.get("type") == "output_text"
+    ]
+    refusals = [part for item in result.get("output", []) for part in (item.get("content") or []) if part.get("type") == "refusal"]
+    if refusals:
+        raise RuntimeError("OpenAI refused the request")
+    data = extract_json("".join(texts))
+    if data is None:
+        raise RuntimeError("OpenAI returned no JSON")
     return data
 
 

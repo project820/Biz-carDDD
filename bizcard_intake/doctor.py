@@ -73,6 +73,14 @@ def check_gws() -> Check:
 
 def check_parser() -> Check:
     backend = parser.backend_name()
+    if backend == "openai":
+        source = parser.openai_key_source()
+        if not source:
+            return Check("parser", False, "OpenAI API 키 없음", "~/.config/gb-invest/decisions.env 에 OPENAI_API_KEY 저장 또는 BIZCARD_PARSER=codex")
+        fallback = parser.fallback_backend("openai") or "없음"
+        model = os.environ.get("BIZCARD_OPENAI_MODEL", parser.DEFAULT_OPENAI_MODEL)
+        effort = os.environ.get("BIZCARD_REASONING_EFFORT", parser.DEFAULT_REASONING_EFFORT)
+        return Check("parser", True, f"OpenAI API {model} (추론 {effort}, 키: {source}, 실패 시 {fallback})")
     binary = parser.find_binary(backend)
     if not binary:
         return Check("parser", False, f"{backend} CLI 없음", "codex: npm install -g @openai/codex && codex login   |   claude: npm install -g @anthropic-ai/claude-code && claude login")

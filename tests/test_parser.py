@@ -32,7 +32,7 @@ class ParserTest(unittest.TestCase):
         self.assertIn("--tools", text_only)
 
     def test_backend_auto_prefers_codex_when_installed(self):
-        with patch.dict(os.environ, {"BIZCARD_PARSER": "auto"}):
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "auto"}), patch.object(parser, "openai_api_key", lambda: ""):
             with patch.object(parser, "find_binary", lambda name: "/bin/codex" if name == "codex" else None):
                 self.assertEqual(parser.backend_name(), "codex")
             with patch.object(parser, "find_binary", lambda name: None):
@@ -74,6 +74,77 @@ class ParserTest(unittest.TestCase):
         self.assertEqual(parser.extract_json('noise {"a": 1} tail'), {"a": 1})
         self.assertIsNone(parser.extract_json("no json"))
         self.assertIsNone(parser.extract_json("[1, 2]"))
+
+
+class OpenAIBackendTest(unittest.TestCase):
+    def test_auto_prefers_openai_when_a_key_is_stored(self):
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "auto"}), patch.object(parser, "openai_api_key", lambda: "sk-test"):
+            self.assertEqual(parser.backend_name(), "openai")
+
+    def test_key_is_read_from_env_file_without_sourcing(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as handle:
+            handle.write("# comment\nexport OPENAI_API_KEY='sk-file'\n")
+        env = {k: v for k, v in os.environ.items() if k != "OPENAI_API_KEY"}
+        env["BIZCARD_OPENAI_ENV_FILE"] = handle.name
+        with patch.dict(os.environ, env, clear=True):
+            self.assertEqual(parser.openai_api_key(), "sk-file")
+            self.assertEqual(parser.openai_key_source(), handle.name)
+        os.unlink(handle.name)
+
+    def test_request_uses_luna_medium_strict_schema_and_inline_image(self):
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as handle:
+            handle.write(b"jpg")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BIZCARD_OPENAI_MODEL", None)
+            os.environ.pop("BIZCARD_REASONING_EFFORT", None)
+            body = parser.openai_request_body("prompt", Path(handle.name))
+        os.unlink(handle.name)
+        self.assertEqual((body["model"], body["reasoning"]["effort"]), ("gpt-6-luna", "medium"))
+        fmt = body["text"]["format"]
+        self.assertTrue(fmt["strict"])
+        self.assertEqual(set(fmt["schema"]["required"]), set(fmt["schema"]["properties"]))
+        image = body["input"][0]["content"][1]
+        self.assertTrue(image["image_url"].startswith("data:image/jpeg;base64,"))
+        self.assertFalse(body["store"])
+
+    def test_api_failure_falls_back_to_codex(self):
+        calls = []
+
+        def fake_run(command, **kwargs):
+            calls.append(command[0])
+            return Completed('{"name": "홍길동", "mobile": ["010-1"]}')
+
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "openai"}), patch.object(parser, "run_openai", side_effect=RuntimeError("OpenAI HTTP 429")), patch.object(
+            parser, "find_binary", lambda name: "/bin/codex" if name == "codex" else None
+        ), patch.object(parser.subprocess, "run", fake_run):
+            data = parser.run_backend("p")
+        self.assertEqual(data["name"], "홍길동")
+        self.assertEqual(calls, ["/bin/codex"])
+
+    def test_run_openai_parses_output_text(self):
+        import io
+        import json as _json
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        payload = {"status": "completed", "model": "gpt-6-luna", "usage": {"input_tokens": 1, "output_tokens": 2},
+                   "output": [{"type": "message", "content": [{"type": "output_text", "text": '{"name": "홍길동"}'}]}]}
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["auth"] = request.get_header("Authorization")
+            return Response(_json.dumps(payload).encode())
+
+        with patch.object(parser, "openai_api_key", lambda: "sk-test"), patch.object(parser.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(parser.run_openai("p", None), {"name": "홍길동"})
+        self.assertEqual(seen["auth"], "Bearer sk-test")
 
 
 if __name__ == "__main__":
