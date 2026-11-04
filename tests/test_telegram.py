@@ -212,6 +212,60 @@ class TelegramTest(unittest.TestCase):
         telegram.recover_interrupted()
         self.assertEqual(cards.load_card(card["id"])["status"], "save_failed")
 
+    def test_album_is_processed_in_parallel_and_summarised_once(self):
+        import threading
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        active, peak = [0], [0]
+        lock = threading.Lock()
+
+        def slow_scan(path):
+            with lock:
+                active[0] += 1
+                peak[0] = max(peak[0], active[0])
+            _time.sleep(0.4)
+            with lock:
+                active[0] -= 1
+            return {"images": {"front": str(path)}, "rectifier": "t", "draft": CardDraft.from_dict({"name": Path(path).stem[-1], "mobile": ["010-1"]})}
+
+        executor = ThreadPoolExecutor(max_workers=4)
+        with patch.object(telegram, "_executor", executor), patch.object(pipeline, "scan_front", slow_scan):
+            started = _time.monotonic()
+            self.run_updates([photo_update(i, f"p{i}", "G2") for i in range(1, 5)])
+            returned = _time.monotonic() - started
+            executor.shutdown(wait=True)
+            total = _time.monotonic() - started
+        self.assertLess(returned, 0.3)  # polling loop is free while cards are processed
+        self.assertLess(total, 1.2)     # 4 x 0.4 s ran concurrently
+        self.assertGreaterEqual(peak[0], 3)
+        self.assertEqual([c["seq"] for c in cards.list_cards()], sorted(c["seq"] for c in cards.list_cards()))
+        summaries = [text for text, _, _ in self.tg.sent if "보낸 명함 4건" in text]
+        self.assertEqual(len(summaries), 1)
+
+    def test_double_tap_saves_once(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        calls, gate = [], threading.Event()
+
+        def slow_save(draft, image, resource_name=None, checkpoint=None):
+            calls.append(1)
+            gate.wait(1)
+            return SaveResult("created", "people/x", "uploaded", [], draft.display_name)
+
+        executor = ThreadPoolExecutor(max_workers=4)
+        data = f"ap:{card['id']}:{card['revision']}"
+        with patch.object(telegram, "_executor", executor), patch.object(pipeline, "save_contact", slow_save):
+            self.run_updates([callback(2, data), callback(3, data)])
+            gate.set()
+            executor.shutdown(wait=True)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(cards.load_card(card["id"])["status"], "saved")
+
     def test_health_check_alerts_admin_chat_on_failed_checks(self):
         failed = [doctor.Check("gws", False, "Google 인증 무효", "gws auth login"), doctor.Check("parser", True, "ok")]
         with patch.object(doctor, "run_checks", lambda names=None: failed), patch.dict(os.environ, {"BIZCARD_ALERT_CHAT_ID": "42"}), patch.object(

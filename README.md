@@ -88,6 +88,10 @@ that cannot read the key deletes `credentials.enc`.
    `휴대전화: 010-1234-5678`, `팩스: -` to clear). These are applied as typed,
    without the AI, and survive re-recognition and back-side merges. Free text
    ("이메일은 kim@acme.com") still goes through the AI reviser.
+   Cards are processed in parallel (`BIZCARD_WORKERS`, default 4): image prep,
+   OCR and the model calls for an album run at the same time, and saves run in
+   the background so buttons stay responsive. A per-card lock keeps double taps,
+   batch saves and automatic retries from saving the same card twice.
 3. `목록` lists every card that is not saved yet, with a save-all button.
 4. If Google is unreachable or logged out, the card is kept as "저장 보류" and
    saved automatically once Google works again (backoff from 2 minutes up to 6

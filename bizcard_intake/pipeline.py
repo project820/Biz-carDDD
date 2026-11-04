@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import time
+from collections import defaultdict
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -33,6 +36,18 @@ RETRY_MAX_SECONDS = 6 * 3600
 AUTH_RETRY_SECONDS = 1800
 
 log = logging.getLogger("bizcard")
+
+_locks_guard = threading.Lock()
+_card_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
+
+
+@contextmanager
+def card_lock(card_id: str):
+    """One save at a time per card (double taps, batch save and retries run on worker threads)."""
+    with _locks_guard:
+        lock = _card_locks[card_id]
+    with lock:
+        yield
 
 
 def profile_image_path(source_path: Path) -> Path:
@@ -147,6 +162,15 @@ def _reopen_for_review(card: dict) -> None:
 
 def approve(card: dict, revision: Optional[int] = None) -> dict:
     """Save the approved revision. Returns a result dict for the channel to render."""
+    with card_lock(card["id"]):
+        fresh = cards.load_card(card["id"])
+        if fresh is not None:
+            card.clear()
+            card.update(fresh)
+        return _approve_locked(card, revision)
+
+
+def _approve_locked(card: dict, revision: Optional[int]) -> dict:
     if card.get("status") == "saved":
         return {"ok": True, "already": True, "message": f"이미 저장된 명함입니다: {current_draft(card).display_name}"}
     if card.get("status") not in cards.REVIEW_STATUSES:
@@ -226,7 +250,12 @@ def retry_due(force: bool = False, on_result: Optional[Callable[[dict, dict], No
             continue
         if not force and (card.get("next_retry_at") or 0) > time.time():
             continue
-        outcome = _save(card)
+        with card_lock(card["id"]):
+            fresh = cards.load_card(card["id"]) or card
+            if fresh.get("status") != "save_failed" or fresh.get("approved_revision") != fresh.get("revision"):
+                continue  # saved or edited meanwhile
+            card = fresh
+            outcome = _save(card)
         if outcome["ok"]:
             saved += 1
         else:

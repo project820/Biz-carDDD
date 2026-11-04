@@ -6,8 +6,10 @@ import json
 import logging
 import logging.handlers
 import os
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote, urlencode
@@ -36,6 +38,74 @@ HELP_TEXT = (
 log = logging.getLogger("bizcard")
 _rejected_chats: set[int] = set()
 
+# Photo work (image prep, OCR, model calls) runs on a small worker pool so an
+# album of cards is processed in parallel and buttons stay responsive. Tests and
+# the CLI leave _executor as None, which runs the work inline.
+_executor: Optional[ThreadPoolExecutor] = None
+_group_lock = threading.Lock()
+_group_pending: dict[tuple[int, str], int] = {}
+_group_summary_wanted: set[tuple[int, str]] = set()
+
+
+def worker_count() -> int:
+    try:
+        return max(1, int(os.environ.get("BIZCARD_WORKERS", "4")))
+    except ValueError:
+        return 4
+
+
+def submit(fn, *args, group: Optional[tuple[int, str]] = None) -> None:
+    """Run photo work on the pool (or inline) and track album completion."""
+    if group:
+        with _group_lock:
+            _group_pending[group] = _group_pending.get(group, 0) + 1
+
+    def job() -> None:
+        try:
+            fn(*args)
+        except Exception:
+            log.exception("background job failed: %s", getattr(fn, "__name__", fn))
+        finally:
+            if group:
+                _group_job_done(group)
+
+    if _executor is None:
+        job()
+    else:
+        _executor.submit(job)
+
+
+def _group_job_done(group: tuple[int, str]) -> None:
+    with _group_lock:
+        _group_pending[group] = _group_pending.get(group, 1) - 1
+        finished = _group_pending[group] <= 0
+        wanted = finished and group in _group_summary_wanted
+        if finished:
+            _group_pending.pop(group, None)
+            _group_summary_wanted.discard(group)
+    if wanted:
+        _safe_group_summary(group)
+
+
+def _request_group_summary(group: tuple[int, str]) -> None:
+    with _group_lock:
+        busy = _group_pending.get(group, 0) > 0
+        if busy:
+            _group_summary_wanted.add(group)
+    if not busy:
+        _safe_group_summary(group)
+
+
+def _safe_group_summary(group: tuple[int, str]) -> None:
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+    try:
+        send_group_summary(_summary_token or token, group[0], group[1])
+    except Exception:
+        log.exception("group summary failed chat=%s group=%s", *group)
+
+
+_summary_token = ""
+
 
 def allowed_chat_ids() -> set[int]:
     raw = os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS", "")
@@ -54,6 +124,10 @@ def run(token: str, data_dir: Path = DATA_DIR) -> None:
     log.info("polling @%s", username)
     print(f"Polling @{username} - Ctrl-C to stop", flush=True)
 
+    global _executor, _summary_token
+    _summary_token = token
+    _executor = ThreadPoolExecutor(max_workers=worker_count(), thread_name_prefix="card")
+    log.info("photo workers=%d", worker_count())
     offset = cards.load_state("telegram").get("offset")
     next_health_check = 0.0
     next_retry_scan = 0.0
@@ -77,6 +151,8 @@ def run(token: str, data_dir: Path = DATA_DIR) -> None:
 
 
 def handle_updates(token: str, updates: list, data_dir: Path = DATA_DIR, offset: Optional[int] = None) -> Optional[int]:
+    global _summary_token
+    _summary_token = _summary_token or token
     groups: set[tuple[int, str]] = set()
     for update in updates:
         offset = update["update_id"] + 1
@@ -90,11 +166,8 @@ def handle_updates(token: str, updates: list, data_dir: Path = DATA_DIR, offset:
         except Exception:
             log.exception("handle_update failed for update_id=%s", update.get("update_id"))
             notify_failure(token, update)
-    for chat_id, media_group_id in sorted(groups):
-        try:
-            send_group_summary(token, chat_id, media_group_id)
-        except Exception:
-            log.exception("group summary failed chat=%s group=%s", chat_id, media_group_id)
+    for group in sorted(groups):
+        _request_group_summary(group)
     return offset
 
 
@@ -214,18 +287,27 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
             waiting = [c for c in cards.list_cards(chat_id, cards.REVIEW_STATUSES) if c.get("awaiting_back")]
             back_target = waiting[-1] if len(waiting) == 1 else None
     if back_target:
-        process_back_photo(token, chat_id, photos, data_dir, back_target)
+        back_target["awaiting_back"] = False  # the next photo must not also go to this card
+        cards.save_card(back_target)
+        submit(process_back_photo, token, chat_id, photos, data_dir, back_target)
         return None
-    card = cards.new_card(chat_id, media_group_id=str(media_group_id) if media_group_id else None)
-    process_front_photo(token, chat_id, photos, data_dir, card)
-    return (chat_id, str(media_group_id)) if media_group_id else None
-
-
-def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict) -> None:
-    log.info("front photo chat=%s card=%s", chat_id, card["id"])
+    # Card creation and the first status message happen here, in update order,
+    # so card numbers follow the album; the slow part runs on the worker pool.
+    group = (chat_id, str(media_group_id)) if media_group_id else None
+    card = cards.new_card(chat_id, media_group_id=group[1] if group else None)
     status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
     cards.remember_message(card, status_id)
     cards.save_card(card)
+    submit(process_front_photo, token, chat_id, photos, data_dir, card, status_id, group=group)
+    return group
+
+
+def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict, status_id: Optional[int] = None) -> None:
+    log.info("front photo chat=%s card=%s", chat_id, card["id"])
+    if status_id is None:
+        status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
+        cards.remember_message(card, status_id)
+        cards.save_card(card)
     try:
         front_path = save_largest_photo(token, photos, chat_id, data_dir, "front", card["id"])
     except Exception:
@@ -268,7 +350,15 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
     card.update(fresh)
 
 
+_summary_lock = threading.Lock()
+
+
 def send_group_summary(token: str, chat_id: int, media_group_id: str) -> None:
+    with _summary_lock:
+        _send_group_summary(token, chat_id, media_group_id)
+
+
+def _send_group_summary(token: str, chat_id: int, media_group_id: str) -> None:
     members = cards.group_cards(chat_id, media_group_id)
     if len(members) < 2:
         return
@@ -369,7 +459,7 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     log.info("callback chat=%s data=%s", chat_id, data)
     action, _, rest = data.partition(":")
     if action == "ba":
-        approve_batch(token, chat_id, rest)
+        submit(approve_batch, token, chat_id, rest)
         return
     if action not in ("ap", "cx", "ed", "bk", "rs", "sv"):
         send_message(token, chat_id, "예전 버튼입니다. 최근 초안 메시지의 버튼을 눌러주세요. ('목록'으로 확인)")
@@ -381,7 +471,7 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
         return
 
     if action in ("ap", "sv"):
-        approve_card(token, chat_id, card, int(revision) if revision.isdigit() and action == "ap" else None)
+        submit(approve_card, token, chat_id, card, int(revision) if revision.isdigit() and action == "ap" else None)
     elif action == "cx":
         if card["status"] == "saved":
             send_message(token, chat_id, f"{cards.label(card)}은(는) 이미 저장되어 취소할 수 없습니다.")
@@ -403,8 +493,14 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
             send_message(token, chat_id, f"{cards.label(card)} 원본 사진이 없어 재인식할 수 없습니다. 사진을 다시 보내주세요.")
             return
         status_id = send_status(token, chat_id, f"{cards.label(card)} 다시 인식하는 중")
-        pipeline.recognize_front(card)
-        show_draft(token, chat_id, card, status_id)
+        card["status"] = "processing"
+        cards.save_card(card)
+        submit(_recognize_again, token, chat_id, card, status_id)
+
+
+def _recognize_again(token: str, chat_id: int, card: dict, status_id: int) -> None:
+    pipeline.recognize_front(card)
+    show_draft(token, chat_id, card, status_id)
 
 
 def approve_card(token: str, chat_id: int, card: dict, revision: Optional[int]) -> dict:
