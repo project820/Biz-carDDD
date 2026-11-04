@@ -138,10 +138,20 @@ Only the name field changes; phones, company, photo and notes are untouched.
 
 ### Messages shows a number instead of the name
 
-Messages decides "unknown sender" when a conversation starts. If the person
-texted before the Google card synced to the Mac (Google syncs roughly hourly),
-the thread can stay unknown. Quit and reopen Messages; if it persists, make any
-small edit to the card so it syncs again, then use "알고 있음으로 표시".
+This is an Apple caching issue; the saved card is fine. When a conversation
+already exists before the card reaches the device, the Messages background
+service (`IMDPersistenceAgent`) keeps its "no contact for this number" result
+until it restarts. Calls look the number up fresh, so they show the name.
+Editing the card, reopening Messages, or restarting `imagent`/`contactsd`
+does not help (checked on 2026-11-04 with 14 affected threads on the Mac mini).
+
+- iPhone: restart the phone.
+- Mac: restart, or quit Messages and run
+  `killall -9 IMDPersistenceAgent contactsdonationagent imagent`, then reopen
+  Messages. All 14 threads showed names right after this.
+
+Name search inside Messages uses a separate index and can lag behind the
+conversation titles.
 
 ## Parser and tokens
 
