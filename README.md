@@ -150,8 +150,14 @@ does not help (checked on 2026-11-04 with 14 affected threads on the Mac mini).
   `killall -9 IMDPersistenceAgent contactsdonationagent imagent`, then reopen
   Messages. All 14 threads showed names right after this.
 
-Name search inside Messages uses a separate index and can lag behind the
-conversation titles.
+Name search inside Messages uses the Messages Spotlight index, which stores the
+contact name known when each message was indexed. Threads indexed while the
+number was unknown are found only by number. A card edit makes Messages
+re-index the thread only if the card's number matches the thread handle in
+`+82` form; with `010-...` it computes 0 chats to re-index (seen in the
+IMDPersistenceAgent log). The bot therefore saves Korean numbers as
+`+82 10-1234-5678`. On iPhone, turning Messages off and on in
+Settings > Search makes it rebuild its index.
 
 ## Parser and tokens
 
