@@ -101,7 +101,7 @@ class OpenAIBackendTest(unittest.TestCase):
             os.environ.pop("BIZCARD_REASONING_EFFORT", None)
             body = parser.openai_request_body("prompt", Path(handle.name))
         os.unlink(handle.name)
-        self.assertEqual((body["model"], body["reasoning"]["effort"]), ("gpt-6-luna", "medium"))
+        self.assertEqual((body["model"], body["reasoning"]["effort"]), ("gpt-6-luna", "low"))
         fmt = body["text"]["format"]
         self.assertTrue(fmt["strict"])
         self.assertEqual(set(fmt["schema"]["required"]), set(fmt["schema"]["properties"]))

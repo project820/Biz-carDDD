@@ -1,6 +1,6 @@
 """Business-card parsing: OpenAI API (default when a key exists), codex or claude CLI.
 
-- openai: Responses API with gpt-6-luna, reasoning effort medium and a strict
+- openai: Responses API with gpt-6-luna, reasoning effort low and a strict
   JSON schema (card_schema.json). Uses the OpenAI API key already stored for the
   Decisions API. Billed per token on the API account.
 - codex / claude: subscription CLIs driven headless; also the fallback when an
@@ -29,7 +29,7 @@ SCHEMA_PATH = Path(__file__).resolve().parent / "card_schema.json"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
 DEFAULT_CLAUDE_MODEL = "haiku"
 DEFAULT_OPENAI_MODEL = "gpt-6-luna"
-DEFAULT_REASONING_EFFORT = "medium"
+DEFAULT_REASONING_EFFORT = "low"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 # Same lookup order as the decision skill: process env, then key files.
 OPENAI_KEY_FILES = ("~/.config/openai/credentials.env", "~/.config/gb-invest/decisions.env")
@@ -45,7 +45,9 @@ FIELD_GUIDE = (
     "notes(인증서·회사 특징·자격증 등 부수 정보), warnings(읽기 어렵거나 누락된 항목과 사유, 문자열 배열).\n"
     "규칙: 추측하지 말고 확실하지 않은 값은 비우고 warnings에 사유를 적어라. 명함에 없는 직함을 만들어 넣지 마라. "
     "휴대전화/회사전화/팩스를 적극 구분해라. '0126~7'처럼 범위로 적힌 번호는 두 번호로 풀어 써라. "
-    "배경 명함·손가락·테이블·반사광에서 온 텍스트는 무시해라.\n"
+    "배경 명함·손가락·테이블·반사광에서 온 텍스트는 무시해라. "
+    "이름·회사명의 한글 철자는 바꾸지 마라. OCR 원문과 이미지가 같은 철자면 그대로 쓰고, "
+    "다르면 이미지의 로고·영문 표기(예: HANA=하나, DAON=다온)와 대조해 맞는 쪽을 골라라.\n"
     "다른 말 없이 JSON 객체 하나만 출력해라."
 )
 

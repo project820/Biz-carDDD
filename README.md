@@ -137,7 +137,7 @@ small edit to the card so it syncs again, then use "알고 있음으로 표시".
 
 | Backend | How | Per card |
 |---|---|---|
-| `openai` (default when an API key is stored) | Responses API, `gpt-6-luna`, reasoning `medium`, strict JSON schema, `store: false` | billed on the OpenAI API account; token counts are logged as `openai model=... tokens in=... out=...` |
+| `openai` (default when an API key is stored) | Responses API, `gpt-6-luna`, reasoning `low`, strict JSON schema, `store: false` | billed on the OpenAI API account; token counts are logged as `openai model=... tokens in=... out=...` |
 | `codex` | `codex exec` in an empty dir with `--ignore-user-config --ignore-rules`, reasoning `low` | ~5–8k tokens of the ChatGPT plan's Codex allowance |
 | `claude` | `claude -p --json-schema --allowedTools Read` | Claude subscription |
 
