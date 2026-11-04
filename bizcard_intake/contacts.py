@@ -187,9 +187,9 @@ def build_person(draft: CardDraft) -> dict[str, Any]:
     if organization:
         person["organizations"] = [organization]
     phone_numbers = (
-        [{"value": v, "type": "mobile"} for v in draft.mobile]
-        + [{"value": v, "type": "work"} for v in draft.work]
-        + [{"value": v, "type": "workFax"} for v in draft.fax]
+        [{"value": international_phone(v), "type": "mobile"} for v in draft.mobile]
+        + [{"value": international_phone(v), "type": "work"} for v in draft.work]
+        + [{"value": international_phone(v), "type": "workFax"} for v in draft.fax]
     )
     if phone_numbers:
         person["phoneNumbers"] = phone_numbers
@@ -243,6 +243,8 @@ def _union(key: str, old_items: list[dict], new_items: list[dict]) -> list[dict]
     seen: set[str] = set()
     for item in old_items:
         kept = {k: item[k] for k in KEEP_KEYS[key] if item.get(k)}
+        if key == "phoneNumbers" and kept.get("value"):
+            kept["value"] = international_phone(kept["value"])
         dedupe = _dedupe_key(key, kept)
         if kept and dedupe not in seen:
             seen.add(dedupe)
@@ -389,6 +391,36 @@ def normalize_phone(value: str) -> str:
         if not digits.startswith("0"):
             digits = "0" + digits
     return digits
+
+
+_KOREAN_GROUPED = re.compile(r"^\(?0(\d{1,3})[)\-.\s]+(\d{3,4})[\-.\s]+(\d{4})$")
+
+
+def international_phone(value: str) -> str:
+    """Korean national numbers in +82 form: '010-5555-0101' -> '+82 10-5555-0101'.
+
+    Messages finds the conversations to re-index for search only when the
+    contact's number matches the thread handle (+821055550101); with the
+    national form a later card edit re-indexes nothing and name search keeps
+    missing the thread. Foreign (+...) and 15xx-style numbers stay as they are.
+    """
+    text = (value or "").strip()
+    if not text or text.startswith("+"):
+        return text
+    grouped = _KOREAN_GROUPED.match(text)
+    if grouped:
+        return f"+82 {grouped.group(1)}-{grouped.group(2)}-{grouped.group(3)}"
+    if not text.isdigit():
+        return text
+    if text.startswith("02") and len(text) in (9, 10):
+        area, rest = "2", text[2:]
+    elif text.startswith("050") and len(text) == 12:
+        area, rest = text[1:4], text[4:]
+    elif text.startswith("0") and not text.startswith("00") and len(text) in (10, 11):
+        area, rest = text[1:3], text[3:]
+    else:
+        return text
+    return f"+82 {area}-{rest[:-4]}-{rest[-4:]}"
 
 
 # ------------------------------------------------------------------ API calls

@@ -69,13 +69,28 @@ class MappingTest(unittest.TestCase):
         person = contacts.build_person(draft)
         self.assertEqual(person["names"], [{"givenName": "홍길동 영업팀장 (주)ACME"}])
         self.assertEqual(person["organizations"], [{"name": "(주) ACME", "title": "영업팀장/컨설턴트 (Sales Executive)"}])
-        self.assertEqual([p["value"] for p in person["phoneNumbers"] if p["type"] == "work"], ["052-555-0126", "052-555-0127"])
+        self.assertEqual([p["value"] for p in person["phoneNumbers"] if p["type"] == "work"], ["+82 52-555-0126", "+82 52-555-0127"])
+        self.assertEqual([p["value"] for p in person["phoneNumbers"] if p["type"] == "mobile"], ["+82 10-1234-5678"])
         self.assertEqual([p["type"] for p in person["phoneNumbers"]], ["mobile", "work", "work", "workFax"])
         self.assertEqual(person["biographies"][0]["value"], "메모\n확인 필요: w")
 
     def test_build_person_omits_empty_organization_keys(self):
         person = contacts.build_person(CardDraft.from_dict({"name": "홍길동", "company": "ACME", "mobile": ["010-1"]}))
         self.assertEqual(person["organizations"], [{"name": "ACME"}])
+
+    def test_international_phone_matches_messages_handles(self):
+        cases = {
+            "010-5555-0101": "+82 10-5555-0101",
+            "02-555-0102": "+82 2-555-0102",
+            "052)555-0127": "+82 52-555-0127",
+            "0505-123-4567": "+82 505-123-4567",
+            "01055550101": "+82 10-5555-0101",
+            "1588-1234": "1588-1234",
+            "+84-86-5555-0109": "+84-86-5555-0109",
+        }
+        for value, expected in cases.items():
+            self.assertEqual(contacts.international_phone(value), expected)
+            self.assertEqual(contacts.normalize_phone(expected), contacts.normalize_phone(value))
 
     def test_normalize_phone_variants(self):
         for value in ("010-1234-5678", "+82 10-1234-5678", "+82 (0)10 1234 5678", "0082-10-1234-5678", "82 10 1234 5678", "+82 010-1234-5678"):
@@ -222,7 +237,7 @@ class SaveContactTest(unittest.TestCase):
         params, body = update[1], update[2]
         self.assertEqual(body["etag"], "e1")
         self.assertEqual(body["names"], [{"givenName": "최민준 차장 (주)다솔이엔지"}])
-        self.assertEqual(body["phoneNumbers"], [{"value": "+82 10-1234-5678", "type": "mobile"}, {"value": "02-555-0000", "type": "home"}, {"value": "052-111-2222", "type": "work"}])
+        self.assertEqual(body["phoneNumbers"], [{"value": "+82 10-1234-5678", "type": "mobile"}, {"value": "+82 2-555-0000", "type": "home"}, {"value": "+82 52-111-2222", "type": "work"}])
         self.assertEqual([e["value"] for e in body["emailAddresses"]], ["old@x.com", "new@x.com"])
         self.assertEqual(params["updatePersonFields"], "names,phoneNumbers,emailAddresses,organizations")
         self.assertNotIn("biographies", body)
