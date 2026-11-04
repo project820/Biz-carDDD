@@ -141,7 +141,17 @@ small edit to the card so it syncs again, then use "알고 있음으로 표시".
 | `codex` | `codex exec` in an empty dir with `--ignore-user-config --ignore-rules`, reasoning `low` | ~5–8k tokens of the ChatGPT plan's Codex allowance |
 | `claude` | `claude -p --json-schema --allowedTools Read` | Claude subscription |
 
-The API key is the one stored for the Decisions API (`~/.config/gb-invest/decisions.env`);
+**Cross-check (default when `ANTHROPIC_API_KEY` is in `.env`).** Every front
+side is read by `gpt-6-luna` (reasoning `low`) and `claude-haiku-5-5` in
+parallel. Phone numbers from both are merged and kept only when both models
+agree, the digits appear in the Apple Vision OCR text, or they are the second
+line of a `~` range; a dropped number is listed in the draft. Names and
+companies that differ are shown as 확인 필요 with both readings. On 21 real
+cards this gave 0 name/company/phone errors (Luna alone 1, Haiku alone 9) at
+about 4 s per card and about 0.001 USD per card. If one API fails the other
+result is used; if both fail the codex/claude CLI takes over.
+
+The OpenAI API key is the one stored for the Decisions API (`~/.config/gb-invest/decisions.env`);
 the bot reads only the `OPENAI_API_KEY` line and never logs it. If an API call
 fails (network, quota, rate limit) the same prompt is retried once with the
 codex CLI, then claude. The image sent to the model is a 1024px copy; the 1600px

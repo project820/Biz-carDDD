@@ -147,5 +147,58 @@ class OpenAIBackendTest(unittest.TestCase):
         self.assertEqual(seen["auth"], "Bearer sk-test")
 
 
+class CrossCheckTest(unittest.TestCase):
+    OCR = "새봄 엔지니어링\n대표이사\n김철수\nMobile. 010-5555-0104\nTel. 031-555-0105\nTel. +84-221-555-0108 Mobile. +84-86-5555-0109\nTEL. 052-555-0126~7"
+
+    def test_phones_are_unioned_and_verified_against_ocr(self):
+        luna = {"name": "김철수", "company": "새봄 엔지니어링", "mobile": ["010-5555-0104", "+84-86-5555-0109"], "work": ["031-555-0105", "02-5555-0106"], "fax": []}
+        haiku = {"name": "김철수", "company": "새봄엔지니어링", "mobile": ["010-5555-0104"], "work": ["031-555-0105", "+84-221-555-0108", "052-555-0126", "052-555-0127"], "fax": []}
+        merged = parser.crosscheck_merge(luna, haiku, self.OCR)
+        self.assertEqual(merged["mobile"], ["010-5555-0104", "+84-86-5555-0109"])
+        self.assertEqual(merged["work"], ["031-555-0105", "+84-221-555-0108", "052-555-0126", "052-555-0127"])
+        self.assertTrue(any("02-5555-0106" in w for w in merged["warnings"]))
+        self.assertFalse(any("엇갈림" in w for w in merged["warnings"]))
+
+    def test_conflicting_company_is_flagged_and_ocr_match_preferred(self):
+        merged = parser.crosscheck_merge({"name": "김철수", "company": "세봄 엔지니어링"}, {"name": "김철수", "company": "새봄 엔지니어링"}, self.OCR)
+        self.assertEqual(merged["company"], "새봄 엔지니어링")
+        self.assertTrue(any("회사명 판독이 엇갈림" in w for w in merged["warnings"]))
+
+    def test_one_api_down_uses_the_other(self):
+        with patch.object(parser, "run_openai", side_effect=RuntimeError("down")), patch.object(parser, "run_anthropic", lambda p, i: {"name": "홍길동"}):
+            self.assertEqual(parser.run_crosscheck("p", Path("/x.jpg"), ""), {"name": "홍길동"})
+
+    def test_enabled_only_with_both_keys(self):
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "openai", "ANTHROPIC_API_KEY": "k", "BIZCARD_CROSSCHECK": "auto"}):
+            self.assertTrue(parser.crosscheck_enabled())
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "openai", "ANTHROPIC_API_KEY": "", "BIZCARD_CROSSCHECK": "auto"}):
+            self.assertFalse(parser.crosscheck_enabled())
+        with patch.dict(os.environ, {"BIZCARD_PARSER": "openai", "ANTHROPIC_API_KEY": "k", "BIZCARD_CROSSCHECK": "off"}):
+            self.assertFalse(parser.crosscheck_enabled())
+
+    def test_run_anthropic_reads_forced_tool_input(self):
+        import io
+        import json as _json
+
+        class Response(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        seen = {}
+
+        def fake_urlopen(request, timeout):
+            seen["key"] = request.get_header("X-api-key")
+            seen["body"] = _json.loads(request.data)
+            return Response(_json.dumps({"model": "claude-haiku-5-5", "usage": {}, "content": [{"type": "tool_use", "name": "business_card", "input": {"name": "홍길동"}}]}).encode())
+
+        with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-test"}), patch.object(parser.urllib.request, "urlopen", fake_urlopen):
+            self.assertEqual(parser.run_anthropic("p", None), {"name": "홍길동"})
+        self.assertEqual(seen["key"], "sk-ant-test")
+        self.assertEqual(seen["body"]["tool_choice"], {"type": "tool", "name": "business_card"})
+
+
 if __name__ == "__main__":
     unittest.main()

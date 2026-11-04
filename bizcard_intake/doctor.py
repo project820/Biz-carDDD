@@ -80,7 +80,8 @@ def check_parser() -> Check:
         fallback = parser.fallback_backend("openai") or "없음"
         model = os.environ.get("BIZCARD_OPENAI_MODEL", parser.DEFAULT_OPENAI_MODEL)
         effort = os.environ.get("BIZCARD_REASONING_EFFORT", parser.DEFAULT_REASONING_EFFORT)
-        return Check("parser", True, f"OpenAI API {model} (추론 {effort}, 키: {source}, 실패 시 {fallback})")
+        cross = f" + 교차검증 {os.environ.get('BIZCARD_ANTHROPIC_MODEL', parser.DEFAULT_ANTHROPIC_MODEL)}" if parser.crosscheck_enabled() else ""
+        return Check("parser", True, f"OpenAI API {model}{cross} (추론 {effort}, 키: {source}, 실패 시 {fallback})")
     binary = parser.find_binary(backend)
     if not binary:
         return Check("parser", False, f"{backend} CLI 없음", "codex: npm install -g @openai/codex && codex login   |   claude: npm install -g @anthropic-ai/claude-code && claude login")
