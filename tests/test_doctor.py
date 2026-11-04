@@ -1,7 +1,9 @@
+import json
 import unittest
 from unittest.mock import patch
 
 from bizcard_intake import doctor
+from bizcard_intake.contacts import ContactSaveError
 
 
 class DoctorTest(unittest.TestCase):
@@ -16,8 +18,26 @@ class DoctorTest(unittest.TestCase):
                 self.assertIn("gws auth login", check.fix)
             with patch.object(doctor, "gws_auth_status", lambda: {"token_valid": True, "scopes": ["openid"]}):
                 self.assertIn("contacts", doctor.check_gws().detail)
+            calls = []
             with patch.object(doctor, "gws_auth_status", lambda: {"token_valid": True, "scopes": [doctor.CONTACTS_SCOPE], "user": "me@x"}):
-                self.assertTrue(doctor.check_gws().ok)
+                with patch.object(doctor, "run_gws", lambda args, **kw: calls.append(args) or {}):
+                    self.assertTrue(doctor.check_gws().ok)
+        self.assertEqual(calls[0][:4], ["people", "people", "connections", "list"])
+        self.assertEqual(json.loads(calls[0][5])["pageSize"], 1)
+
+    def test_gws_check_runs_real_read(self):
+        status = {"token_valid": True, "scopes": [doctor.CONTACTS_SCOPE], "user": "me@x"}
+        auth = ContactSaveError("Google 로그인이 만료되었습니다.", kind="auth")
+        with patch.object(doctor.shutil, "which", lambda name: "/bin/gws"), patch.object(doctor, "gws_auth_status", lambda: status):
+            with patch.object(doctor, "run_gws", side_effect=auth):
+                check = doctor.check_gws()
+            self.assertFalse(check.ok)
+            self.assertIn("로그인이 만료", check.detail)
+            self.assertEqual(check.fix, doctor.LOGIN_COMMAND)
+            with patch.object(doctor, "run_gws", side_effect=ContactSaveError("Google 서버 일시 오류(502).", kind="transient", retryable=True)):
+                check = doctor.check_gws()
+            self.assertFalse(check.ok)
+            self.assertIn("502", check.detail)
 
     def test_parser_check_reports_missing_cli(self):
         with patch.object(doctor.parser, "backend_name", lambda: "codex"), patch.object(doctor.parser, "find_binary", lambda name: None):

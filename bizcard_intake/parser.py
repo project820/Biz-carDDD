@@ -28,10 +28,12 @@ EXTRA_BIN_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 log = logging.getLogger("bizcard")
 
 FIELD_GUIDE = (
-    "JSON 필드: name(이름만, 직책 제외), title(직책, 명함에 없으면 '대표'), company(회사명), "
+    "JSON 필드: name(사람 이름만, 직함 제외), title(명함에 적힌 직함 원문 그대로, 없으면 빈 문자열), "
+    "display_title(전화 수신 화면에 붙일 짧은 직함 하나. 예: '영업팀장/컨설턴트 (Sales Executive)' -> '영업팀장', "
+    "'대표이사 사장' -> '대표이사', 명함에 직함이 없으면 빈 문자열), company(회사명, 명함 표기 그대로), "
     "mobile, work, fax, email, website, address(각각 문자열 배열), "
     "notes(인증서·회사 특징·자격증 등 부수 정보), warnings(읽기 어렵거나 누락된 항목과 사유, 문자열 배열).\n"
-    "규칙: 추측하지 말고 확실하지 않은 값은 비우고 warnings에 사유를 적어라. "
+    "규칙: 추측하지 말고 확실하지 않은 값은 비우고 warnings에 사유를 적어라. 명함에 없는 직함을 만들어 넣지 마라. "
     "휴대전화/회사전화/팩스를 적극 구분해라. '0126~7'처럼 범위로 적힌 번호는 두 번호로 풀어 써라. "
     "배경 명함·손가락·테이블·반사광에서 온 텍스트는 무시해라.\n"
     "다른 말 없이 JSON 객체 하나만 출력해라."
@@ -91,7 +93,7 @@ def merge_drafts(front: CardDraft, back: CardDraft) -> CardDraft:
 def revise_draft(draft: CardDraft, reply: str) -> Optional[CardDraft]:
     prompt = (
         "아래 명함 초안(JSON)을 승인자의 답변에 따라 수정해라. "
-        "답변에서 언급하지 않은 항목은 그대로 유지하고, 답변으로 해소된 warnings 항목은 지워라.\n\n"
+        "답변에서 언급하지 않은 항목은 그대로 유지하고, 답변으로 해소된 warnings 항목은 지워라. locked 필드는 그대로 둬라.\n\n"
         f"{FIELD_GUIDE}\n\n[초안]\n{draft.to_json()}\n\n[승인자 답변]\n{reply}"
     )
     data = run_backend(prompt)

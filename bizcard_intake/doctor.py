@@ -11,7 +11,7 @@ from typing import Callable, Optional
 from urllib.request import urlopen
 
 from . import parser
-from .contacts import CONTACTS_SCOPE, LOGIN_COMMAND, gws_auth_status
+from .contacts import CONTACTS_SCOPE, LOGIN_COMMAND, ContactSaveError, gws_auth_status, run_gws
 from .image_processing import _ensure_vision_rectifier
 from .vision_ocr import _ensure_vision_ocr
 
@@ -60,6 +60,14 @@ def check_gws() -> Check:
     scopes = status.get("scopes") or []
     if CONTACTS_SCOPE not in scopes:
         return Check("gws", False, "토큰에 contacts 권한 없음", LOGIN_COMMAND)
+    # auth status only reads the stored token; a real read catches vanished
+    # credentials ("No credentials provided") and revoked grants.
+    params = {"resourceName": "people/me", "pageSize": 1, "personFields": "names"}
+    try:
+        run_gws(["people", "people", "connections", "list", "--params", json.dumps(params)])
+    except ContactSaveError as exc:
+        fix = "잠시 후 bizcard doctor 재실행" if exc.kind == "transient" else LOGIN_COMMAND
+        return Check("gws", False, f"Google Contacts 읽기 실패: {exc}", fix)
     return Check("gws", True, f"로그인됨: {status.get('user', '?')}")
 
 

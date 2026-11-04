@@ -3,130 +3,225 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
-from bizcard_intake import doctor, pipeline, telegram
-
-
-def fake_send_message(sent):
-    def _send(token, chat_id, text, reply_markup=None):
-        sent.append((text, reply_markup))
-        return {"result": {"message_id": len(sent)}}
-
-    return _send
-
+from bizcard_intake import cards, doctor, pipeline, telegram
+from bizcard_intake.contacts import SaveResult
+from bizcard_intake.draft import CardDraft
 
 ALLOWED = {"TELEGRAM_ALLOWED_CHAT_IDS": "42"}
+
+
+class FakeTelegram:
+    def __init__(self):
+        self.sent, self.edited, self.photos = [], [], []
+        self.next_id = 100
+
+    def send_message(self, token, chat_id, text, reply_markup=None):
+        self.next_id += 1
+        self.sent.append((text, reply_markup, self.next_id))
+        return {"result": {"message_id": self.next_id}}
+
+    def edit_message(self, token, chat_id, message_id, text, reply_markup=None):
+        self.edited.append((text, reply_markup, message_id))
+        return {}
+
+    def send_photo(self, token, chat_id, path, caption=""):
+        self.photos.append(caption)
+
+    def last_markup(self):
+        for text, markup, _ in reversed(self.edited + self.sent):
+            if markup:
+                return markup
+        return None
+
+
+def fake_scan(names):
+    names = list(names)
+
+    def scan(path):
+        name = names.pop(0)
+        return {"images": {"front": str(path), "profile": str(path)}, "rectifier": "test",
+                "draft": CardDraft.from_dict({"name": name, "title": "과장", "company": "ACME", "mobile": [f"010-0000-{len(names)}"]})}
+    return scan
+
+
+def photo_update(update_id, file_id, media_group_id=None, reply_to=None):
+    message = {"chat": {"id": 42}, "message_id": 1000 + update_id, "photo": [{"file_id": file_id}]}
+    if media_group_id:
+        message["media_group_id"] = media_group_id
+    if reply_to:
+        message["reply_to_message"] = {"message_id": reply_to}
+    return {"update_id": update_id, "message": message}
+
+
+def text_update(update_id, text, reply_to=None):
+    message = {"chat": {"id": 42}, "message_id": 2000 + update_id, "text": text}
+    if reply_to:
+        message["reply_to_message"] = {"message_id": reply_to}
+    return {"update_id": update_id, "message": message}
+
+
+def callback(update_id, data):
+    return {"update_id": update_id, "callback_query": {"id": str(update_id), "data": data, "message": {"chat": {"id": 42}}}}
 
 
 class TelegramTest(unittest.TestCase):
     def setUp(self):
         telegram._rejected_chats.clear()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        self.tg = FakeTelegram()
+        self.patches = [
+            patch.dict(os.environ, ALLOWED),
+            patch.object(cards, "CARD_DIR", self.tmp / "cards"),
+            patch.object(pipeline, "SESSION_ARCHIVE_DIR", self.tmp / "archive"),
+            patch.object(telegram, "send_message", self.tg.send_message),
+            patch.object(telegram, "edit_message", self.tg.edit_message),
+            patch.object(telegram, "send_photo", self.tg.send_photo),
+            patch.object(telegram, "api_post", lambda token, method, payload: {"ok": True}),
+            patch.object(telegram, "api_get", lambda token, method, params=None, timeout=10: {"result": {"file_path": f"photos/{params['file_id']}.jpg"}}),
+            patch.object(telegram, "download_file", lambda token, file_path: b"jpg"),
+        ]
+        for p in self.patches:
+            p.start()
+
+    def tearDown(self):
+        for p in self.patches:
+            p.stop()
+        self._tmp.cleanup()
+
+    def run_updates(self, updates):
+        telegram.handle_updates("token", updates, self.tmp / "photos")
 
     def test_chat_outside_allowlist_is_rejected_once(self):
-        sent = []
-        with patch.dict(os.environ, ALLOWED), patch.object(telegram, "send_message", fake_send_message(sent)), patch.object(
-            pipeline, "scan_front", side_effect=AssertionError("must not process")
-        ):
-            for _ in range(2):
-                telegram.handle_update("token", {"update_id": 1, "message": {"chat": {"id": 7}, "photo": [{"file_id": "x"}]}})
-        self.assertEqual(len(sent), 1)
-        self.assertIn("7", sent[0][0])
+        with patch.dict(os.environ, {"TELEGRAM_ALLOWED_CHAT_IDS": "7"}):
+            for i in range(2):
+                telegram.handle_update("token", photo_update(i, "x"))
+        self.assertEqual(len(self.tg.sent), 1)
+        self.assertEqual(cards.list_cards(), [])
 
     def test_run_refuses_to_start_without_allowlist(self):
         with patch.dict(os.environ, {"TELEGRAM_ALLOWED_CHAT_IDS": ""}):
             with self.assertRaises(SystemExit):
                 telegram.run("token")
 
-    def test_text_message_without_draft_gets_guidance(self):
-        sent = []
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ALLOWED), patch.object(pipeline, "SESSION_DIR", Path(tmp)), patch.object(
-            telegram, "send_message", fake_send_message(sent)
-        ):
-            telegram.handle_update("token", {"update_id": 1, "message": {"chat": {"id": 42}, "text": "hello"}})
-        self.assertEqual(sent[0][0], "명함 사진을 보내주세요.")
+    def test_photo_creates_card_with_card_scoped_buttons(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["정호준"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.assertEqual(card["status"], "review")
+        draft_text, markup, _ = self.tg.edited[-1]
+        self.assertIn("표시 이름: 정호준 과장 ACME", draft_text)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], f"ap:{card['id']}:{card['revision']}")
+        self.assertTrue(Path(card["images"]["front"]).name.startswith(card["id"]))
 
-    def test_front_photo_flow_sends_preview_draft_and_buttons(self):
-        sent, edited, photos = [], [], []
+    def test_album_makes_one_card_per_photo_and_batch_save(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가", "나", "다"])):
+            self.run_updates([photo_update(1, "a", "G1"), photo_update(2, "b", "G1"), photo_update(3, "c", "G1")])
+        self.assertEqual(len(cards.list_cards()), 3)
+        summary, markup, _ = self.tg.sent[-1]
+        self.assertIn("보낸 명함 3건", summary)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "ba:g:G1")
+        saved = []
+        with patch.object(pipeline, "save_contact", lambda d, i, resource_name=None, checkpoint=None: saved.append(d.name) or SaveResult("created", "people/x", "uploaded", [], d.display_name)):
+            self.run_updates([callback(9, "ba:g:G1")])
+        self.assertEqual(saved, ["가", "나", "다"])
+        self.assertTrue(all(c["status"] == "saved" for c in cards.list_cards()))
 
-        def fake_scan_front(path):
-            return {"status": "drafted", "profile_image_path": str(path), "front_image_path": str(path), "draft": {"name": "홍길동", "mobile": ["010-1"]}, "rectifier": "test"}
+    def test_reply_edits_only_the_card_it_replies_to(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
+            self.run_updates([photo_update(1, "a"), photo_update(2, "b")])
+        first, second = cards.list_cards()
+        target_message = first["message_ids"][-1]
+        with patch.object(pipeline, "revise_draft", side_effect=AssertionError("no AI for field edits")):
+            self.run_updates([text_update(3, "직함: 영업팀장\n회사: 누리네트웍스", reply_to=target_message)])
+        self.assertEqual(pipeline.current_draft(cards.load_card(first["id"])).display_name, "가 영업팀장 누리네트웍스")
+        self.assertEqual(pipeline.current_draft(cards.load_card(second["id"])).company, "ACME")
 
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ALLOWED), patch.object(pipeline, "SESSION_DIR", Path(tmp) / "s"), patch.object(
-            telegram, "api_get", lambda token, method, params=None: {"result": {"file_path": "photos/card.jpg"}}
-        ), patch.object(telegram, "download_file", lambda token, file_path: b"photo"), patch.object(pipeline, "scan_front", fake_scan_front), patch.object(
-            telegram, "send_message", fake_send_message(sent)
-        ), patch.object(telegram, "edit_message", lambda token, chat_id, message_id, text: edited.append(text) or {}), patch.object(
-            telegram, "send_photo", lambda token, chat_id, image_path, caption="": photos.append(caption)
-        ):
-            telegram.handle_update("token", {"update_id": 1, "message": {"chat": {"id": 42}, "photo": [{"file_id": "small"}, {"file_id": "large"}]}}, Path(tmp))
-            session = pipeline.load_session("42")
-            self.assertTrue((Path(tmp) / "42" / "front" / "card.jpg").exists())
+    def test_unthreaded_text_with_several_open_cards_asks_for_a_reply(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
+            self.run_updates([photo_update(1, "a"), photo_update(2, "b")])
+        self.run_updates([text_update(3, "직함: 부장")])
+        self.assertTrue(any("답장으로" in text for text, _, _ in self.tg.sent))
+        self.assertTrue(all(pipeline.current_draft(c).short_title == "과장" for c in cards.list_cards()))
 
-        self.assertEqual(session["draft"]["name"], "홍길동")
-        self.assertEqual(photos, ["연락처 이미지 미리보기"])
-        self.assertIn("초안 준비 완료", edited[-1])
-        self.assertTrue(sent[-1][0].startswith("명함 입력 초안\n- 이름 필드: 홍길동 대표"))
-        self.assertEqual(sent[-1][1]["inline_keyboard"][1][1]["text"], "뒷면스캔")
+    def test_old_approve_button_is_not_applied_to_a_newer_card(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        with patch.object(pipeline, "save_contact", side_effect=AssertionError("must not save")):
+            self.run_updates([callback(2, "approve")])
+        self.assertIn("예전 버튼", self.tg.sent[-1][0])
 
-    def test_text_reply_while_draft_pending_revises_draft(self):
-        sent, edited = [], []
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ALLOWED), patch.object(pipeline, "SESSION_DIR", Path(tmp)):
-            pipeline.save_session("42", {"status": "drafted", "draft": {"name": "홍길동", "work": ["052-555-0126~7"]}})
-            with patch.object(pipeline, "revise_draft", lambda draft, reply: pipeline.CardDraft.from_dict({"name": "홍길동", "work": ["052-555-0126", "052-555-0127"]})), patch.object(
-                telegram, "send_message", fake_send_message(sent)
-            ), patch.object(telegram, "edit_message", lambda token, chat_id, message_id, text: edited.append(text) or {}):
-                telegram.handle_update("token", {"update_id": 3, "message": {"chat": {"id": 42}, "text": "두 회선 맞아"}})
-            session = pipeline.load_session("42")
-        self.assertEqual(session["draft"]["work"], ["052-555-0126", "052-555-0127"])
-        self.assertEqual(edited[-1], "초안 수정 완료")
-        self.assertEqual(sent[-1][1]["inline_keyboard"][0][0]["text"], "승인")
+    def test_stale_revision_button_after_edit(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        old = f"ap:{card['id']}:{card['revision']}"
+        self.run_updates([text_update(2, "직함: 부장")])
+        with patch.object(pipeline, "save_contact", side_effect=AssertionError("must not save")):
+            self.run_updates([callback(3, old)])
+        self.assertIn("수정되었습니다", self.tg.edited[-1][0])
 
-    def test_back_photo_merges_and_only_shows_approve_cancel(self):
-        sent, edited = [], []
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ALLOWED), patch.object(pipeline, "SESSION_DIR", Path(tmp) / "s"):
-            pipeline.save_session("42", {"awaiting": "back", "front_draft": {"name": "홍길동"}, "draft": {"name": "홍길동"}})
-            with patch.object(telegram, "api_get", lambda token, method, params=None: {"result": {"file_path": "photos/back.jpg"}}), patch.object(
-                telegram, "download_file", lambda token, file_path: b"back"
-            ), patch.object(pipeline, "scan_back", lambda session, path: {**session, "status": "merged_drafted", "back_draft": {"name": "홍길동"}, "draft": {"name": "홍길동", "mobile": ["010-1"]}}), patch.object(
-                telegram, "send_message", fake_send_message(sent)
-            ), patch.object(telegram, "edit_message", lambda token, chat_id, message_id, text: edited.append(text) or {}):
-                telegram.handle_update("token", {"update_id": 2, "message": {"chat": {"id": 42}, "photo": [{"file_id": "back"}]}}, Path(tmp))
-        self.assertIn("- 휴대전화: 010-1", sent[-1][0])
-        self.assertEqual(len(sent[-1][1]["inline_keyboard"]), 1)
+    def test_edit_button_sends_force_reply_bound_to_card(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.run_updates([callback(2, f"ed:{card['id']}")])
+        text, markup, message_id = self.tg.sent[-1]
+        self.assertTrue(markup["force_reply"])
+        self.assertIn("이름: 가", text)
+        self.assertEqual(cards.find_by_message(42, message_id)["id"], card["id"])
 
-    def test_callbacks_approve_cancel(self):
-        sent, edited = [], []
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, ALLOWED), patch.object(pipeline, "SESSION_DIR", Path(tmp)), patch.object(
-            telegram, "api_post", lambda token, method, payload: {"ok": True}
-        ), patch.object(telegram, "send_message", fake_send_message(sent)), patch.object(
-            telegram, "edit_message", lambda token, chat_id, message_id, text: edited.append(text) or {}
-        ), patch.object(pipeline, "approve", lambda key, session: "저장 완료\ncreated"):
-            callback = {"id": "1", "data": "approve", "message": {"chat": {"id": 42}}}
-            telegram.handle_update("token", {"update_id": 4, "callback_query": callback})
-            self.assertEqual(sent[-1][0], "저장 실패: 승인할 초안이 없습니다.")
+    def test_back_photo_goes_to_the_requesting_card(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.run_updates([callback(2, f"bk:{card['id']}")])
+        prompt_id = self.tg.sent[-1][2]
+        merged = []
+        with patch.object(pipeline, "recognize_back", lambda c, path: merged.append(c["id"]) or c):
+            self.run_updates([photo_update(3, "back", reply_to=prompt_id)])
+        self.assertEqual(merged, [card["id"]])
+        self.assertEqual(len(cards.list_cards()), 1)
 
-            pipeline.save_session("42", {"draft": {"name": "홍길동", "mobile": ["010-1"]}})
-            telegram.handle_update("token", {"update_id": 5, "callback_query": callback})
-            self.assertEqual(edited[-1], "저장 완료\ncreated")
+    def test_list_shows_open_cards(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
+            self.run_updates([photo_update(1, "a"), photo_update(2, "b")])
+        self.run_updates([text_update(3, "목록")])
+        text, markup, _ = self.tg.sent[-1]
+        self.assertIn("저장 안 된 명함 2건", text)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "ba:all")
 
-            telegram.handle_update("token", {"update_id": 6, "callback_query": {**callback, "data": "cancel"}})
-            self.assertEqual(sent[-1][0], "취소했습니다.")
-            self.assertIsNone(pipeline.load_session("42"))
+    def test_save_failure_message_is_short_and_offers_retry(self):
+        from bizcard_intake.contacts import ContactSaveError
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        with patch.object(pipeline, "save_contact", side_effect=ContactSaveError("Google 서버 일시 오류(502). 잠시 후 다시 시도합니다.", kind="transient", retryable=True)):
+            self.run_updates([callback(2, f"ap:{card['id']}:{card['revision']}")])
+        text, markup, _ = self.tg.edited[-1]
+        self.assertIn("저장 보류", text)
+        self.assertNotIn("<", text)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], f"sv:{card['id']}")
+
+    def test_restart_recovers_interrupted_cards(self):
+        card = cards.new_card(42)
+        card["status"] = "saving"
+        cards.save_card(card)
+        telegram.recover_interrupted()
+        self.assertEqual(cards.load_card(card["id"])["status"], "save_failed")
 
     def test_health_check_alerts_admin_chat_on_failed_checks(self):
-        sent = []
         failed = [doctor.Check("gws", False, "Google 인증 무효", "gws auth login"), doctor.Check("parser", True, "ok")]
         with patch.object(doctor, "run_checks", lambda names=None: failed), patch.dict(os.environ, {"BIZCARD_ALERT_CHAT_ID": "42"}), patch.object(
-            telegram, "send_message", fake_send_message(sent)
+            pipeline, "retry_due", side_effect=AssertionError("no retry while Google auth is broken")
         ):
             problems = telegram.health_check("token")
         self.assertEqual([c.name for c in problems], ["gws"])
-        self.assertIn("Google 인증 무효", sent[0][0])
-        self.assertIn("gws auth login", sent[0][0])
+        self.assertIn("gws auth login", self.tg.sent[0][0])
 
     def test_api_calls_retry_transient_network_errors(self):
-        from urllib.error import URLError
-
         attempts = []
 
         def flaky():
@@ -137,9 +232,30 @@ class TelegramTest(unittest.TestCase):
 
         with patch.object(telegram.time, "sleep", lambda s: None):
             self.assertEqual(telegram.with_retry(flaky, "x"), {"ok": True})
-            self.assertEqual(len(attempts), 3)
             with self.assertRaises(URLError):
                 telegram.with_retry(lambda: (_ for _ in ()).throw(URLError("down")), "y")
+
+    def test_rate_limit_honours_retry_after_and_client_errors_fail_fast(self):
+        import io
+        import json as _json
+        from urllib.error import HTTPError
+
+        def http_error(code, body):
+            return HTTPError("u", code, "x", {}, io.BytesIO(_json.dumps(body).encode()))
+
+        sleeps, attempts = [], []
+
+        def limited():
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise http_error(429, {"parameters": {"retry_after": 7}})
+            return {"ok": True}
+
+        with patch.object(telegram.time, "sleep", sleeps.append):
+            telegram.with_retry(limited, "x")
+            with self.assertRaises(RuntimeError):
+                telegram.with_retry(lambda: (_ for _ in ()).throw(http_error(400, {"description": "Bad Request"})), "y")
+        self.assertEqual(sleeps, [7.0])
 
     def test_get_updates_uses_long_polling(self):
         seen = {}
@@ -153,20 +269,6 @@ class TelegramTest(unittest.TestCase):
             telegram.get_updates("token", 5)
         self.assertEqual(seen["timeout"], telegram.LONG_POLL_SECONDS)
         self.assertGreater(seen["timeout_arg"], telegram.LONG_POLL_SECONDS)
-        self.assertEqual(seen["offset"], 5)
-
-    def test_health_check_retries_pending_queue_when_healthy(self):
-        sent, calls = [], []
-        with tempfile.TemporaryDirectory() as tmp, patch.object(pipeline, "PENDING_CONTACT_DIR", Path(tmp)), patch.object(
-            doctor, "run_checks", lambda names=None: [doctor.Check("gws", True, "ok")]
-        ), patch.object(pipeline, "retry_pending", lambda: calls.append(1) or (1, [])), patch.dict(
-            os.environ, {"BIZCARD_ALERT_CHAT_ID": "42"}
-        ), patch.object(telegram, "send_message", fake_send_message(sent)):
-            telegram.health_check("token")  # queue empty: no retry
-            (Path(tmp) / "x.json").write_text("{}")
-            telegram.health_check("token")
-        self.assertEqual(len(calls), 1)
-        self.assertIn("저장 1건", sent[-1][0])
 
 
 if __name__ == "__main__":

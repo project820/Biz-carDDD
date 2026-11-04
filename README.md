@@ -58,36 +58,78 @@ from expiring:
   expires.
 
 If the token still dies (password change, admin revocation, 6 months unused),
-the bot tells the `BIZCARD_ALERT_CHAT_ID` chat within a day, failed saves wait in
-`data/pending_contacts/`, and `python -m bizcard_intake retry-pending` replays
-them after you log in again.
+the bot tells the `BIZCARD_ALERT_CHAT_ID` chat within a day, failed saves stay
+on hold as cards and are saved automatically after you log in again
+(`python -m bizcard_intake retry-pending` forces it).
+
+Log in from Terminal.app. When macOS asks about the `gws-cli` Keychain item,
+choose "Always Allow".
 
 ## Using the bot
 
-1. Send a card photo. The bot rectifies it, runs OCR and the parser, and replies
-   with a preview image plus a draft:
+1. Send one or more card photos (an album is fine). Every photo becomes its own
+   card with a number, a preview image and a draft:
    ```
-   명함 입력 초안
-   - 이름 필드: 홍길동 이사
-   - 성씨 필드: ACME
-   - 휴대전화: 010-1234-5678
+   [명함 12] 명함 초안
+   표시 이름: 정호준 영업팀장 누리네트웍스
+
+   - 이름: 정호준
+   - 직함: 영업팀장
+   - 직함원문: 영업팀장/컨설턴트 (Sales Executive)
+   - 회사: 누리네트웍스
+   - 휴대전화: 010-5555-0101
    ...
-   - 검증 경고: 회사전화 끝자리 확인 필요
    ```
-2. Reply with plain text to correct anything ("두 회선 맞아", "이메일은 kim@acme.com").
-   The draft is revised and re-sent.
-3. 승인 saves the contact and deletes the card images. 뒷면스캔 merges the back side first.
+   Buttons: 저장 · 직접 수정 · 뒷면 추가 · 인식 재시도 · 취소. For an album the bot
+   also sends a summary with "저장 가능한 N건 모두 저장".
+2. To fix a card, reply to its draft with `항목: 값` lines (`직함: 과장`,
+   `휴대전화: 010-1234-5678`, `팩스: -` to clear). These are applied as typed,
+   without the AI, and survive re-recognition and back-side merges. Free text
+   ("이메일은 kim@acme.com") still goes through the AI reviser.
+3. `목록` lists every card that is not saved yet, with a save-all button.
+4. If Google is unreachable or logged out, the card is kept as "저장 보류" and
+   saved automatically once Google works again (backoff from 2 minutes up to 6
+   hours; checked every minute and at the daily health check). A contact whose
+   photo upload failed is saved anyway and the photo is retried.
 
-### Design choices (intentional, Korean cards)
+Cards live in `data/cards/<id>.json` (one file each, atomic writes). Old
+`data/sessions` and `data/pending_contacts` files are migrated on startup:
+entries already saved are retired, approved-but-failed ones become retry
+cards, and drafts nobody approved stay in review and are never saved on their
+own.
 
-- Google *given name* = full name + title (`홍길동 이사`), *family name* = company.
-  With thousands of contacts, name + company on the caller screen is what makes
-  a person recognisable, and the card photo is the second check.
-- A missing title becomes `대표`.
+### Design choices (Korean cards)
+
+- The phone and Messages show `이름 짧은직함 회사`, e.g. `최민준 차장 (주)다솔이엔지`.
+  That whole string is Google's *given name*; *family name* stays empty so the
+  device's first/last-name order cannot put the company first. The full title
+  and company stay in the organization fields.
+- No title is invented; a card without one gets a 확인 필요 note.
 - `052-555-0126~7` is saved as two numbers without asking.
-- Duplicate detection scans all contacts (mobile + name) instead of
-  `searchContacts`, whose index lags minutes behind `createContact`.
+- Duplicate detection scans all contacts and needs a matching mobile number and
+  exact name; a retry reuses the contact id the first attempt created.
 - Card images are deleted after a successful save.
+
+### Renaming contacts saved with the old layout
+
+Contacts saved before November 2026 have the company in the family name. Run in
+Terminal.app (not from an agent, see AGENTS.md):
+
+```bash
+python3 -m bizcard_intake migrate-names                # preview
+python3 -m bizcard_intake migrate-names --apply --limit 1
+python3 -m bizcard_intake migrate-names --apply        # everything, backup first
+python3 -m bizcard_intake rollback-names data/name-migration/<backup>.json
+```
+
+Only the name field changes; phones, company, photo and notes are untouched.
+
+### Messages shows a number instead of the name
+
+Messages decides "unknown sender" when a conversation starts. If the person
+texted before the Google card synced to the Mac (Google syncs roughly hourly),
+the thread can stay unknown. Quit and reopen Messages; if it persists, make any
+small edit to the card so it syncs again, then use "알고 있음으로 표시".
 
 ## Parser and tokens
 
@@ -126,8 +168,9 @@ Google token and alerts `BIZCARD_ALERT_CHAT_ID` on failure.
 python -m bizcard_intake doctor              # environment report
 python -m bizcard_intake setup               # guided fixes
 python -m bizcard_intake scan card.jpg       # parse one image locally, print the draft
-python -m bizcard_intake save data/sessions/cli-card.json
-python -m bizcard_intake retry-pending
+python -m bizcard_intake save <card-id>
+python -m bizcard_intake retry-pending     # retry saves on hold now
+python -m bizcard_intake list              # cards not saved yet
 python -m bizcard_intake bot                 # what start_bot.sh runs
 ```
 

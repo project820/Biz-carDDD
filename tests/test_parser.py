@@ -51,7 +51,7 @@ class ParserTest(unittest.TestCase):
         with patch.dict(os.environ, {"BIZCARD_PARSER": "codex"}), patch.object(parser, "find_binary", lambda name: "/bin/codex"), patch.object(parser.subprocess, "run", fake_run):
             draft = parser.parse_card(Path("/img.jpg"), ocr, "front")
 
-        self.assertEqual(draft.name_field, "홍길동 대표")
+        self.assertEqual(draft.display_name, "홍길동 ACME")
         self.assertIn("010-1234-5678", calls[0][1])  # OCR text is passed to the model
         self.assertIn("--image", calls[0][0])
 
