@@ -16,7 +16,7 @@ from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from . import cards, doctor, pipeline
+from . import cards, contacts, doctor, pipeline
 from .pipeline import DATA_DIR, LOG_DIR
 
 API_BASE = "https://api.telegram.org"
@@ -49,9 +49,9 @@ _group_summary_wanted: set[tuple[int, str]] = set()
 
 def worker_count() -> int:
     try:
-        return max(1, int(os.environ.get("BIZCARD_WORKERS", "4")))
+        return max(1, int(os.environ.get("BIZCARD_WORKERS", "30")))
     except ValueError:
-        return 4
+        return 30
 
 
 def submit(fn, *args, group: Optional[tuple[int, str]] = None) -> None:
@@ -75,6 +75,10 @@ def submit(fn, *args, group: Optional[tuple[int, str]] = None) -> None:
         _executor.submit(job)
 
 
+_progress_at: dict[tuple[int, str], float] = {}
+PROGRESS_EVERY = 3.0
+
+
 def _group_job_done(group: tuple[int, str]) -> None:
     with _group_lock:
         _group_pending[group] = _group_pending.get(group, 1) - 1
@@ -83,8 +87,27 @@ def _group_job_done(group: tuple[int, str]) -> None:
         if finished:
             _group_pending.pop(group, None)
             _group_summary_wanted.discard(group)
+            _progress_at.pop(group, None)
+        show_progress = not finished and time.monotonic() - _progress_at.get(group, 0.0) >= PROGRESS_EVERY
+        if show_progress:
+            _progress_at[group] = time.monotonic()
     if wanted:
         _safe_group_summary(group)
+    elif show_progress:
+        _update_group_progress(group)
+
+
+def _update_group_progress(group: tuple[int, str]) -> None:
+    members = cards.group_cards(group[0], group[1])
+    done = sum(1 for c in members if c.get("status") != "processing")
+    with _summary_lock:
+        message_id = cards.load_state("groups").get(f"{group[0]}:{group[1]}")
+    if not message_id:
+        return
+    try:
+        edit_message(_summary_token, group[0], message_id, f"보낸 명함 {len(members)}장 처리 중: 완료 {done}/{len(members)}")
+    except Exception:
+        log.warning("progress update failed group=%s", group[1])
 
 
 def _request_group_summary(group: tuple[int, str]) -> None:
@@ -105,6 +128,7 @@ def _safe_group_summary(group: tuple[int, str]) -> None:
 
 
 _summary_token = ""
+_summary_lock = threading.RLock()
 
 
 def allowed_chat_ids() -> set[int]:
@@ -291,20 +315,36 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
         cards.save_card(back_target)
         submit(process_back_photo, token, chat_id, photos, data_dir, back_target)
         return None
-    # Card creation and the first status message happen here, in update order,
-    # so card numbers follow the album; the slow part runs on the worker pool.
+    # Card creation happens here, in update order, so card numbers follow the
+    # album; image prep, OCR and the model calls run on the worker pool.
     group = (chat_id, str(media_group_id)) if media_group_id else None
     card = cards.new_card(chat_id, media_group_id=group[1] if group else None)
+    if group:
+        _ensure_group_progress(token, group)
+        submit(process_front_photo, token, chat_id, photos, data_dir, card, None, True, group=group)
+        return group
     status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
     cards.remember_message(card, status_id)
     cards.save_card(card)
-    submit(process_front_photo, token, chat_id, photos, data_dir, card, status_id, group=group)
-    return group
+    submit(process_front_photo, token, chat_id, photos, data_dir, card, status_id)
+    return None
 
 
-def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict, status_id: Optional[int] = None) -> None:
+def _ensure_group_progress(token: str, group: tuple[int, str]) -> None:
+    """One message per album that shows progress and later becomes the summary."""
+    key = f"{group[0]}:{group[1]}"
+    with _summary_lock:
+        state = cards.load_state("groups")
+        if state.get(key):
+            return
+        result = send_message(token, group[0], "보낸 명함 처리 중… (명함마다 사진과 초안이 하나씩 옵니다)")
+        state[key] = result["result"]["message_id"]
+        cards.save_state("groups", state)
+
+
+def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict, status_id: Optional[int] = None, album: bool = False) -> None:
     log.info("front photo chat=%s card=%s", chat_id, card["id"])
-    if status_id is None:
+    if status_id is None and not album:
         status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
         cards.remember_message(card, status_id)
         cards.save_card(card)
@@ -313,14 +353,22 @@ def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, 
     except Exception:
         log.exception("photo download failed card=%s", card["id"])
         pipeline.cancel(card)
-        edit_message(token, chat_id, status_id, f"{cards.label(card)} 사진을 받지 못했습니다. 다시 보내주세요.")
+        text = f"{cards.label(card)} 사진을 받지 못했습니다. 다시 보내주세요."
+        if status_id is not None:
+            edit_message(token, chat_id, status_id, text)
+        else:
+            send_message(token, chat_id, text)
         return
     card["images"]["front"] = str(front_path)
     pipeline.recognize_front(card, front_path)
     profile = card["images"].get("profile")
-    if profile and Path(profile).exists():
+    preview = Path(profile) if profile and Path(profile).exists() else None
+    if album:
+        show_draft(token, chat_id, card, photo=preview)
+        return
+    if preview:
         try:
-            send_photo(token, chat_id, Path(profile), f"{cards.label(card)} 연락처 사진 미리보기")
+            send_photo(token, chat_id, preview, f"{cards.label(card)} 연락처 사진 미리보기")
         except Exception:
             log.exception("preview send failed card=%s", card["id"])
     show_draft(token, chat_id, card, status_id)
@@ -333,10 +381,21 @@ def process_back_photo(token: str, chat_id: int, photos: list, data_dir: Path, c
     show_draft(token, chat_id, card, status_id)
 
 
-def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optional[int] = None, prefix: str = "") -> None:
+CAPTION_LIMIT = 1024
+
+
+def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optional[int] = None, prefix: str = "", photo: Optional[Path] = None) -> None:
     text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(card) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
     message_id = None
-    if replace_message_id is not None:
+    if photo is not None:
+        try:
+            if len(text) <= CAPTION_LIMIT:
+                message_id = send_photo(token, chat_id, photo, text, reply_markup=draft_buttons(card))["result"]["message_id"]
+            else:
+                send_photo(token, chat_id, photo, f"{cards.label(card)} 연락처 사진 미리보기")
+        except Exception:
+            log.exception("preview send failed card=%s", card["id"])
+    if message_id is None and replace_message_id is not None:
         try:
             edit_message(token, chat_id, replace_message_id, text, reply_markup=draft_buttons(card))
             message_id = replace_message_id
@@ -348,9 +407,6 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
     cards.remember_message(fresh, message_id)
     cards.save_card(fresh)
     card.update(fresh)
-
-
-_summary_lock = threading.Lock()
 
 
 def send_group_summary(token: str, chat_id: int, media_group_id: str) -> None:
@@ -523,13 +579,21 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
     if not targets:
         send_message(token, chat_id, "저장할 수 있는 명함이 없습니다.")
         return
-    status_id = send_status(token, chat_id, f"{len(targets)}건 저장 중…")
+    status_id = send_status(token, chat_id, f"{len(targets)}건 저장 중… (Google 연락처는 한 건씩 저장합니다)")
     lines = []
     ok = 0
-    for card in targets:
-        outcome = pipeline.approve(card)
-        ok += 1 if outcome["ok"] else 0
-        lines.append(f"- {cards.label(card)} {pipeline.current_draft(card).display_name}: {'저장' if outcome['ok'] else '보류 · ' + outcome['message']}")
+    last_progress = time.monotonic()
+    with contacts.contact_snapshot():
+        for index, card in enumerate(targets, 1):
+            outcome = pipeline.approve(card)
+            ok += 1 if outcome["ok"] else 0
+            lines.append(f"- {cards.label(card)} {pipeline.current_draft(card).display_name}: {'저장' if outcome['ok'] else '보류 · ' + outcome['message']}")
+            if index < len(targets) and time.monotonic() - last_progress >= 5:
+                last_progress = time.monotonic()
+                try:
+                    edit_message(token, chat_id, status_id, f"{len(targets)}건 저장 중… {index}/{len(targets)}")
+                except Exception:
+                    pass
     skipped = [c for c in members if c["status"] == "review" and c not in targets]
     text = f"일괄 저장 {ok}/{len(targets)}건 완료\n" + "\n".join(lines)
     if skipped:
@@ -622,7 +686,23 @@ def send_status(token: str, chat_id: int, text: str) -> int:
     return send_message(token, chat_id, text)["result"]["message_id"]
 
 
+_pace_lock = threading.Lock()
+_last_send: dict[int, float] = {}
+
+
+def _pace(chat_id: int) -> None:
+    """Keep messages to one chat spaced out; Telegram throttles bursts per chat."""
+    interval = float(os.environ.get("BIZCARD_TELEGRAM_INTERVAL", "0.35"))
+    with _pace_lock:
+        now = time.monotonic()
+        wait = _last_send.get(chat_id, 0.0) + interval - now
+        _last_send[chat_id] = max(now, _last_send.get(chat_id, 0.0) + interval)
+    if wait > 0:
+        time.sleep(wait)
+
+
 def send_message(token: str, chat_id: int, text: str, reply_markup: Optional[dict] = None) -> dict:
+    _pace(chat_id)
     payload = {"chat_id": chat_id, "text": text[:4000]}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -630,6 +710,7 @@ def send_message(token: str, chat_id: int, text: str, reply_markup: Optional[dic
 
 
 def edit_message(token: str, chat_id: int, message_id: int, text: str, reply_markup: Optional[dict] = None) -> dict:
+    _pace(chat_id)
     payload = {"chat_id": chat_id, "message_id": message_id, "text": text[:4000]}
     if reply_markup:
         payload["reply_markup"] = reply_markup
@@ -641,11 +722,13 @@ def edit_message(token: str, chat_id: int, message_id: int, text: str, reply_mar
         raise
 
 
-def send_photo(token: str, chat_id: int, image_path: Path, caption: str = "") -> None:
+def send_photo(token: str, chat_id: int, image_path: Path, caption: str = "", reply_markup: Optional[dict] = None) -> dict:
+    _pace(chat_id)
     boundary = f"----bizcard-{uuid.uuid4().hex}"
     parts = [
         _multipart_field(boundary, "chat_id", str(chat_id)),
-        _multipart_field(boundary, "caption", caption),
+        _multipart_field(boundary, "caption", caption[:CAPTION_LIMIT]),
+        *([_multipart_field(boundary, "reply_markup", json.dumps(reply_markup))] if reply_markup else []),
         _multipart_file(boundary, "photo", image_path.name, "image/jpeg", image_path.read_bytes()),
         f"--{boundary}--\r\n".encode("utf-8"),
     ]
@@ -663,6 +746,7 @@ def send_photo(token: str, chat_id: int, image_path: Path, caption: str = "") ->
     result = with_retry(call, "Telegram sendPhoto")
     if result.get("ok") is not True:
         raise RuntimeError(result.get("description") or "Telegram sendPhoto failed")
+    return result
 
 
 def _multipart_field(boundary: str, name: str, value: str) -> bytes:
@@ -681,29 +765,38 @@ def delete_webhook(token: str) -> None:
     api_post(token, "deleteWebhook", {"drop_pending_updates": False})
 
 
+RATE_LIMIT_WAITS = 8
+
+
 def with_retry(call, label: str, attempts: int = RETRY_ATTEMPTS):
-    """Retry transient network failures; honour Telegram's retry_after; fail fast on 4xx."""
-    for attempt in range(1, attempts + 1):
+    """Retry transient network failures; wait out Telegram's 429 retry_after
+    (not counted as a failed attempt); fail fast on other 4xx."""
+    attempt, rate_waits = 1, 0
+    while True:
         try:
             return call()
         except HTTPError as exc:
             body = _http_error_body(exc)
-            if exc.code == 429:
-                delay = float(((body or {}).get("parameters") or {}).get("retry_after") or RETRY_DELAY * attempt)
-            elif 400 <= exc.code < 500:
+            if exc.code == 429 and rate_waits < RATE_LIMIT_WAITS:
+                rate_waits += 1
+                delay = float(((body or {}).get("parameters") or {}).get("retry_after") or RETRY_DELAY * rate_waits)
+                log.warning("%s rate limited; waiting %.0fs (%d/%d)", label, delay, rate_waits, RATE_LIMIT_WAITS)
+                time.sleep(min(delay, 60))
+                continue
+            if 400 <= exc.code < 500:
                 description = (body or {}).get("description") or f"HTTP {exc.code}"
                 raise RuntimeError(f"{label}: {description}") from exc
-            else:
-                delay = RETRY_DELAY * attempt
-            if attempt == attempts:
+            if attempt >= attempts:
                 raise
-            log.warning("%s failed (HTTP %s); retry %d/%d in %.0fs", label, exc.code, attempt, attempts - 1, delay)
-            time.sleep(min(delay, 60))
+            log.warning("%s failed (HTTP %s); retry %d/%d", label, exc.code, attempt, attempts - 1)
+            time.sleep(RETRY_DELAY * attempt)
+            attempt += 1
         except (URLError, ConnectionError, TimeoutError, OSError) as exc:
-            if attempt == attempts:
+            if attempt >= attempts:
                 raise
             log.warning("%s failed (%s); retry %d/%d", label, exc, attempt, attempts - 1)
             time.sleep(RETRY_DELAY * attempt)
+            attempt += 1
 
 
 def _http_error_body(exc: HTTPError) -> Optional[dict]:

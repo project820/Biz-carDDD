@@ -18,8 +18,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import subprocess
+import threading
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -47,6 +50,9 @@ KEEP_KEYS = {
     "urls": ("value", "type"),
     "addresses": ("formattedValue", "type", "poBox", "streetAddress", "extendedAddress", "city", "region", "postalCode", "country", "countryCode"),
 }
+
+
+log = logging.getLogger("bizcard")
 
 
 class ContactSaveError(RuntimeError):
@@ -105,10 +111,12 @@ def save_contact(
         update_contact(existing, draft)
         action, saved_name = "updated", existing["resourceName"]
     else:
-        saved = create_contact(build_person(draft))
+        new_person = build_person(draft)
+        saved = create_contact(new_person)
         saved_name = saved.get("resourceName") if isinstance(saved, dict) else None
         if not saved_name:
             raise ContactSaveError(UNKNOWN_OUTCOME_MESSAGE, kind="unknown_outcome", detail=json.dumps(saved, ensure_ascii=False)[:500])
+        _remember_created(saved_name, new_person)
         action = "created"
 
     if checkpoint is not None:
@@ -289,7 +297,43 @@ def find_existing_candidates(draft: CardDraft) -> tuple[Optional[dict[str, Any]]
     return None, len(matches)
 
 
+_snapshot = threading.local()
+
+
+@contextmanager
+def contact_snapshot():
+    """Scan all contacts once for a batch of saves on this thread.
+
+    Batch saves are sequential (Google asks for one mutation at a time per
+    user); without this every card re-reads the whole address book (~3 s).
+    Contacts created inside the block are added so later cards still see them.
+    """
+    try:
+        _snapshot.people = list(_scan_connections(SCAN_FIELDS))
+    except ContactSaveError as exc:
+        log.warning("contact snapshot failed, scanning per card: %s", exc)
+        _snapshot.people = None
+    try:
+        yield
+    finally:
+        _snapshot.people = None
+
+
+def _remember_created(resource_name: str, person: dict[str, Any]) -> None:
+    people = getattr(_snapshot, "people", None)
+    if people is not None:
+        people.append({"resourceName": resource_name, "names": person.get("names", []), "phoneNumbers": person.get("phoneNumbers", [])})
+
+
 def iter_connections(person_fields: str):
+    people = getattr(_snapshot, "people", None)
+    if people is not None and person_fields == SCAN_FIELDS:
+        yield from list(people)
+        return
+    yield from _scan_connections(person_fields)
+
+
+def _scan_connections(person_fields: str):
     page_token = None
     while True:
         params: dict[str, Any] = {"resourceName": "people/me", "personFields": person_fields, "pageSize": 1000}

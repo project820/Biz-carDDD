@@ -26,8 +26,13 @@ class FakeTelegram:
         self.edited.append((text, reply_markup, message_id))
         return {}
 
-    def send_photo(self, token, chat_id, path, caption=""):
-        self.photos.append(caption)
+    def send_photo(self, token, chat_id, path, caption="", reply_markup=None):
+        self.next_id += 1
+        self.photos.append((caption, reply_markup, self.next_id))
+        return {"result": {"message_id": self.next_id}}
+
+    def all_texts(self):
+        return [t for t, _, _ in self.sent] + [t for t, _, _ in self.edited] + [c for c, _, _ in self.photos]
 
     def last_markup(self):
         for text, markup, _ in reversed(self.edited + self.sent):
@@ -79,6 +84,7 @@ class TelegramTest(unittest.TestCase):
             patch.object(telegram, "send_message", self.tg.send_message),
             patch.object(telegram, "edit_message", self.tg.edit_message),
             patch.object(telegram, "send_photo", self.tg.send_photo),
+            patch.dict(os.environ, {"BIZCARD_TELEGRAM_INTERVAL": "0"}),
             patch.object(telegram, "api_post", lambda token, method, payload: {"ok": True}),
             patch.object(telegram, "api_get", lambda token, method, params=None, timeout=10: {"result": {"file_path": f"photos/{params['file_id']}.jpg"}}),
             patch.object(telegram, "download_file", lambda token, file_path: b"jpg"),
@@ -120,7 +126,14 @@ class TelegramTest(unittest.TestCase):
         with patch.object(pipeline, "scan_front", fake_scan(["가", "나", "다"])):
             self.run_updates([photo_update(1, "a", "G1"), photo_update(2, "b", "G1"), photo_update(3, "c", "G1")])
         self.assertEqual(len(cards.list_cards()), 3)
-        summary, markup, _ = self.tg.sent[-1]
+        progress_id = self.tg.sent[0][2]
+        self.assertEqual(len(self.tg.sent), 1)  # one progress message for the whole album
+        self.assertEqual(len(self.tg.photos), 3)  # one photo+draft message per card
+        caption, buttons, _ = self.tg.photos[0]
+        self.assertIn("표시 이름:", caption)
+        self.assertTrue(buttons["inline_keyboard"][0][0]["callback_data"].startswith("ap:"))
+        summary, markup, edited_id = self.tg.edited[-1]
+        self.assertEqual(edited_id, progress_id)
         self.assertIn("보낸 명함 3건", summary)
         self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "ba:g:G1")
         saved = []
@@ -227,7 +240,7 @@ class TelegramTest(unittest.TestCase):
             _time.sleep(0.4)
             with lock:
                 active[0] -= 1
-            return {"images": {"front": str(path)}, "rectifier": "t", "draft": CardDraft.from_dict({"name": Path(path).stem[-1], "mobile": ["010-1"]})}
+            return {"images": {"front": str(path), "profile": str(path)}, "rectifier": "t", "draft": CardDraft.from_dict({"name": Path(path).stem[-1], "mobile": ["010-1"]})}
 
         executor = ThreadPoolExecutor(max_workers=4)
         with patch.object(telegram, "_executor", executor), patch.object(pipeline, "scan_front", slow_scan):
@@ -240,8 +253,45 @@ class TelegramTest(unittest.TestCase):
         self.assertLess(total, 1.2)     # 4 x 0.4 s ran concurrently
         self.assertGreaterEqual(peak[0], 3)
         self.assertEqual([c["seq"] for c in cards.list_cards()], sorted(c["seq"] for c in cards.list_cards()))
-        summaries = [text for text, _, _ in self.tg.sent if "보낸 명함 4건" in text]
+        summaries = [text for text, _, _ in self.tg.edited if "보낸 명함 4건" in text]
         self.assertEqual(len(summaries), 1)
+        self.assertEqual(len(self.tg.sent), 1)
+
+    def test_thirty_card_album_with_thirty_workers(self):
+        import time as _time
+        from concurrent.futures import ThreadPoolExecutor
+
+        def scan(path):
+            _time.sleep(0.3)
+            return {"images": {"front": str(path), "profile": str(path)}, "rectifier": "t", "draft": CardDraft.from_dict({"name": "가", "mobile": ["010-1"]})}
+
+        executor = ThreadPoolExecutor(max_workers=telegram.worker_count())
+        with patch.object(telegram, "_executor", executor), patch.object(pipeline, "scan_front", scan):
+            started = _time.monotonic()
+            self.run_updates([photo_update(i, f"p{i}", "G30") for i in range(1, 31)])
+            executor.shutdown(wait=True)
+            total = _time.monotonic() - started
+        self.assertEqual(telegram.worker_count(), 30)
+        self.assertLess(total, 2.0)  # 30 x 0.3 s sequentially would be 9 s
+        self.assertEqual(len(self.tg.photos), 30)
+        self.assertTrue(any("보낸 명함 30건" in text for text, _, _ in self.tg.edited))
+
+    def test_rate_limit_wait_does_not_use_up_attempts(self):
+        import io
+        import json as _json
+        from urllib.error import HTTPError
+
+        calls = []
+
+        def limited():
+            calls.append(1)
+            if len(calls) <= 5:
+                raise HTTPError("u", 429, "x", {}, io.BytesIO(_json.dumps({"parameters": {"retry_after": 1}}).encode()))
+            return {"ok": True}
+
+        with patch.object(telegram.time, "sleep", lambda s: None):
+            self.assertEqual(telegram.with_retry(limited, "x"), {"ok": True})
+        self.assertEqual(len(calls), 6)
 
     def test_double_tap_saves_once(self):
         import threading

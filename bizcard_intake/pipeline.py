@@ -20,7 +20,7 @@ from typing import Callable, Optional
 from . import cards
 from .contacts import ContactSaveError, SaveResult, save_contact, upload_photo
 from .draft import CardDraft, apply_edits, parse_edits, preserve_locked
-from .image_processing import PreparedImages, prepare_card_images
+from .image_processing import PreparedImages, prepare_card_images as _prepare_card_images
 from .parser import merge_drafts, parse_card, revise_draft
 from .vision_ocr import extract_text
 
@@ -36,6 +36,22 @@ RETRY_MAX_SECONDS = 6 * 3600
 AUTH_RETRY_SECONDS = 1800
 
 log = logging.getLogger("bizcard")
+
+# Image prep and Apple Vision OCR are CPU-bound; with 30 card workers only this
+# many run at once (the model calls, which only wait on the network, do not count).
+import os as _os
+_cpu_slots = threading.BoundedSemaphore(max(2, (_os.cpu_count() or 4)))
+
+
+def prepare_card_images(*args, **kwargs):
+    with _cpu_slots:
+        return _prepare_card_images(*args, **kwargs)
+
+
+def _ocr(path):
+    with _cpu_slots:
+        return extract_text(path)
+
 
 _locks_guard = threading.Lock()
 _card_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
@@ -77,7 +93,7 @@ def scan_front(front_path: Path) -> dict:
         "llm": str(prepared.llm_path),
         "rectified": str(prepared.rectified_path) if prepared.rectified_path else None,
     }
-    ocr = extract_text(prepared.ocr_path)
+    ocr = _ocr(prepared.ocr_path)
     log.info("vision ocr image=%s lines=%d avg_conf=%.3f", prepared.ocr_path.name, len(ocr.lines), ocr.average_confidence)
     draft = parse_card(prepared.llm_path, ocr, "front")
     log.info("front draft done image=%s elapsed=%.1fs", front_path.name, time.monotonic() - started)
@@ -115,7 +131,7 @@ def recognize_back(card: dict, back_path: Path) -> dict:
     previous = current_draft(card)
     try:
         prepared = prepare_card_images(back_path, back_path.parent.parent / "back_tmp" / f"{back_path.stem}_profile.jpg")
-        back = parse_card(prepared.llm_path, extract_text(prepared.ocr_path), "back")
+        back = parse_card(prepared.llm_path, _ocr(prepared.ocr_path), "back")
         cleanup_paths(prepared.profile_path, prepared.ocr_path, prepared.llm_path, prepared.rectified_path)
         merged = merge_drafts(previous, back)
         card["back_draft"] = back.to_dict()
