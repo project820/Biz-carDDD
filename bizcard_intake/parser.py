@@ -250,27 +250,39 @@ def crosscheck_merge(luna: dict, haiku: dict, ocr_text: str) -> dict:
     ocr_squashed = _squash(ocr_text)
 
     fields = ("mobile", "work", "fax")
-    seen: dict[str, tuple[str, str, int]] = {}  # digits -> (field, value, votes)
-    for source in (luna, haiku):
+    # A number can sit in two fields on one card (TEL 0126~7 / FAX 0127), so
+    # placement is per (field, digits): Luna's fields first, Haiku adds numbers
+    # Luna did not read at all. Votes are per number across both models.
+    seen: dict[str, str] = {}  # digits -> first value seen (for warnings)
+    votes: dict[str, int] = {}
+    placed: list[tuple[str, str, str]] = []  # (field, digits, value)
+    luna_keys: set[str] = set()
+    for index, source in enumerate((luna, haiku)):
+        source_keys: set[str] = set()
         for field in fields:
             for value in source.get(field) or []:
                 key = _digits(value)
                 if len(key) < 7:
                     continue
-                if key in seen:
-                    old_field, old_value, votes = seen[key]
-                    seen[key] = (old_field, old_value, votes + 1)
-                else:
-                    seen[key] = (field, value, 1)
-    verified = {k for k, (_, _, votes) in seen.items() if votes >= 2 or k in ocr_digits}
+                source_keys.add(key)
+                seen.setdefault(key, value)
+                if index == 1 and key in luna_keys:
+                    continue
+                if not any(f == field and k == key for f, k, _ in placed):
+                    placed.append((field, key, value))
+        for key in source_keys:
+            votes[key] = votes.get(key, 0) + 1
+        if index == 0:
+            luna_keys = source_keys
+    verified = {k for k in seen if votes.get(k, 0) >= 2 or k in ocr_digits}
     for key in list(seen):
         if key in verified or not has_range:
             continue
         if any(v[:-2] == key[:-2] and v != key for v in verified):
             verified.add(key)
-    dropped = [seen[k][1] for k in seen if k not in verified]
+    dropped = [seen[k] for k in seen if k not in verified]
     for field in fields:
-        merged[field] = [value for key, (f, value, _) in seen.items() if f == field and key in verified]
+        merged[field] = [value for f, key, value in placed if f == field and key in verified]
     if dropped:
         log.info("cross-check dropped unverified numbers: %s", ", ".join(dropped))
         warnings.append(f"한 모델만 읽고 OCR에 없는 번호 제외: {', '.join(dropped)} (맞으면 직접 추가)")

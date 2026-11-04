@@ -159,6 +159,13 @@ class CrossCheckTest(unittest.TestCase):
         self.assertTrue(any("02-5555-0106" in w for w in merged["warnings"]))
         self.assertFalse(any("엇갈림" in w for w in merged["warnings"]))
 
+    def test_same_number_as_tel_and_fax_keeps_both(self):
+        reading = {"name": "박영수", "work": ["052-555-0126", "052-555-0127"], "fax": ["052-555-0127"], "mobile": ["010-5555-0107"]}
+        ocr = "TEL. 052)555-0126~7\nFAX. 052)555-0127\n010-5555-0107"
+        merged = parser.crosscheck_merge(dict(reading), dict(reading), ocr)
+        self.assertEqual(merged["work"], ["052-555-0126", "052-555-0127"])
+        self.assertEqual(merged["fax"], ["052-555-0127"])
+
     def test_conflicting_company_is_flagged_and_ocr_match_preferred(self):
         merged = parser.crosscheck_merge({"name": "김철수", "company": "세봄 엔지니어링"}, {"name": "김철수", "company": "새봄 엔지니어링"}, self.OCR)
         self.assertEqual(merged["company"], "새봄 엔지니어링")
