@@ -30,20 +30,31 @@ missing pieces.
 
 ```bash
 git clone https://github.com/project820/Biz-carDDD.git && cd Biz-carDDD
-cp .env.example .env               # TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS
+pip install -r requirements.txt
+cp .env.example .env               # TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, OPENAI_API_KEY ...
+export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file   # before any gws call, see below
+set -a; source .env; set +a       # setup/doctor read the values from the environment
 python3 -m bizcard_intake setup    # checks gws / codex or claude / telegram, guides Google login
 ./scripts/start_bot.sh
 ```
 
-Send the bot any message to learn your chat id, put it in
-`TELEGRAM_ALLOWED_CHAT_IDS`, restart. Only listed chats can use the bot; everyone
-else gets a one-line refusal.
+The bot refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS`, so get your chat id
+first: send your new bot any message, then run
+`curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"` and copy the
+`"chat":{"id":...}` number into `TELEGRAM_ALLOWED_CHAT_IDS`. Only listed chats can
+use the bot; everyone else gets a one-line refusal that shows their chat id, so
+adding more people later is easy.
 
 ### Google login, once
 
 ```bash
-gws auth login --scopes https://www.googleapis.com/auth/contacts
+GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file gws auth login --scopes https://www.googleapis.com/auth/contacts
 ```
+
+Always run `gws` with `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file` (`.env.example`
+sets it for the bot; add the export to your shell profile too). If one call uses
+the macOS keychain instead, `gws` cannot decrypt the stored login, deletes it and
+you have to log in again.
 
 `gws` needs an OAuth client in **your own** Google Cloud project. With `gcloud`
 installed, `gws auth setup --login` creates the project and client for you;
@@ -177,8 +188,10 @@ cards this gave 0 name/company/phone errors (Luna alone 1, Haiku alone 9) at
 about 4 s per card and about 0.001 USD per card. If one API fails the other
 result is used; if both fail the codex/claude CLI takes over.
 
-The OpenAI API key is the one stored for the Decisions API (`~/.config/gb-invest/decisions.env`);
-the bot reads only the `OPENAI_API_KEY` line and never logs it. If an API call
+Put the OpenAI API key in `.env` as `OPENAI_API_KEY=`, or point
+`BIZCARD_OPENAI_ENV_FILE` at another env file; the bot reads only the
+`OPENAI_API_KEY` line and never logs it. Without a key the bot uses the codex or
+claude CLI. If an API call
 fails (network, quota, rate limit) the same prompt is retried once with the
 codex CLI, then claude. The image sent to the model is a 1024px copy; the 1600px
 one is only for Apple Vision OCR. Typed `항목: 값` edits, saving and retries use no
@@ -186,6 +199,8 @@ model at all.
 
 Set `BIZCARD_PARSER=openai|codex|claude`, `BIZCARD_OPENAI_MODEL`,
 `BIZCARD_REASONING_EFFORT`, `BIZCARD_CODEX_MODEL`, `BIZCARD_CLAUDE_MODEL` in `.env`.
+The default model ids are the ones this project was tuned with; if your account
+does not offer them, set these variables to models you can use.
 
 ## Run as a launchd service (auto-start, auto-restart)
 
@@ -220,22 +235,33 @@ python -m bizcard_intake bot                 # what start_bot.sh runs
 TELEGRAM_BOT_TOKEN=              # required
 TELEGRAM_ALLOWED_CHAT_IDS=       # required, comma-separated
 BIZCARD_ALERT_CHAT_ID=           # health alerts
-BIZCARD_PARSER=auto              # auto | codex | claude
+BIZCARD_PARSER=auto              # auto | openai | codex | claude
+OPENAI_API_KEY=                  # openai parser (auto picks it when set)
+BIZCARD_OPENAI_MODEL=gpt-6-luna
+BIZCARD_REASONING_EFFORT=low
+ANTHROPIC_API_KEY=               # optional cross-check with Claude Haiku
+BIZCARD_ANTHROPIC_MODEL=claude-haiku-5-5
+BIZCARD_CROSSCHECK=auto          # off disables the cross-check
 BIZCARD_CODEX_MODEL=gpt-5.6-luna
 BIZCARD_CLAUDE_MODEL=haiku
 BIZCARD_PARSER_TIMEOUT=90
+BIZCARD_WORKERS=30               # cards processed at the same time
 BIZCARD_PYTHON=                  # interpreter with numpy/Pillow (default: python3 on PATH)
+GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
 ```
 
 ## Privacy
 
-Card images and OCR text are sent to the model provider you chose (OpenAI via
-Codex, or Anthropic via Claude Code) and the parsed fields to Google Contacts.
-Nothing else leaves the machine. Images are deleted after a successful save.
+Card images and OCR text are sent to the model provider you use: the OpenAI API
+or Codex CLI, and Anthropic (Claude Haiku API for the cross-check, or the Claude
+Code CLI). The parsed fields and card photo go to your Google Contacts. Nothing
+else leaves the machine. Card drafts, logs and images stay in `data/`, which is
+git-ignored; images are deleted after a successful save.
 
 ## Tests
 
 ```bash
+pip install -r requirements.txt    # image tests need Pillow and numpy
 python3 -m unittest discover -s tests
 ```
 

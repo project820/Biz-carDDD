@@ -76,7 +76,7 @@ def check_parser() -> Check:
     if backend == "openai":
         source = parser.openai_key_source()
         if not source:
-            return Check("parser", False, "OpenAI API 키 없음", "~/.config/gb-invest/decisions.env 에 OPENAI_API_KEY 저장 또는 BIZCARD_PARSER=codex")
+            return Check("parser", False, "OpenAI API 키 없음", ".env에 OPENAI_API_KEY=... 저장 또는 BIZCARD_PARSER=codex")
         fallback = parser.fallback_backend("openai") or "없음"
         model = os.environ.get("BIZCARD_OPENAI_MODEL", parser.DEFAULT_OPENAI_MODEL)
         effort = os.environ.get("BIZCARD_REASONING_EFFORT", parser.DEFAULT_REASONING_EFFORT)
@@ -104,7 +104,7 @@ def check_telegram() -> Check:
     if not token:
         return Check("telegram", False, "TELEGRAM_BOT_TOKEN 없음", ".env에 @BotFather 토큰을 넣으세요")
     if not os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS"):
-        return Check("telegram", False, "TELEGRAM_ALLOWED_CHAT_IDS 없음 (허용된 채팅만 봇을 쓸 수 있습니다)", "봇에 아무 메시지나 보내면 chat id를 알려줍니다. 그 값을 .env에 넣으세요")
+        return Check("telegram", False, "TELEGRAM_ALLOWED_CHAT_IDS 없음 (허용된 채팅만 봇을 쓸 수 있습니다)", "봇에 메시지를 보낸 뒤 https://api.telegram.org/bot<토큰>/getUpdates 의 chat.id 값을 .env에 넣으세요")
     try:
         with urlopen(f"https://api.telegram.org/bot{token}/getMe", timeout=10) as response:
             payload = json.loads(response.read().decode("utf-8"))
