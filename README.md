@@ -1,9 +1,10 @@
 # Bizcard Intake Bot
 
 Telegram bot that turns a photo of a business card into a Google Contacts entry.
-Runs on a Mac, costs nothing beyond subscriptions you already have: parsing
-goes through the **Codex CLI (ChatGPT Plus or higher)** or the **Claude Code CLI
-(Claude subscription)**, and saving goes through the free `gws` CLI.
+Runs on a Mac. Parsing goes through the **OpenAI API** when `OPENAI_API_KEY` is
+set (billed per card, optional Claude Haiku cross-check with `ANTHROPIC_API_KEY`),
+otherwise through the **Codex CLI (ChatGPT Plus or higher)** or the **Claude Code
+CLI (Claude subscription)** at no extra cost. Saving goes through the free `gws` CLI.
 
 ```
 photo ─▶ Apple Vision rectify + OCR ─▶ codex / claude (JSON) ─▶ draft in Telegram
@@ -31,19 +32,25 @@ missing pieces.
 ```bash
 git clone https://github.com/project820/Biz-carDDD.git && cd Biz-carDDD
 pip install -r requirements.txt
-cp .env.example .env               # TELEGRAM_BOT_TOKEN, TELEGRAM_ALLOWED_CHAT_IDS, OPENAI_API_KEY ...
+cp .env.example .env
 export GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file   # before any gws call, see below
-set -a; source .env; set +a       # setup/doctor read the values from the environment
-python3 -m bizcard_intake setup    # checks gws / codex or claude / telegram, guides Google login
-./scripts/start_bot.sh
 ```
 
-The bot refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS`, so get your chat id
-first: send your new bot any message, then run
-`curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"` and copy the
-`"chat":{"id":...}` number into `TELEGRAM_ALLOWED_CHAT_IDS`. Only listed chats can
-use the bot; everyone else gets a one-line refusal that shows their chat id, so
-adding more people later is easy.
+Then, in order:
+
+1. Put the bot token from @BotFather in `.env` (`TELEGRAM_BOT_TOKEN=`), plus
+   `OPENAI_API_KEY=` if you want the API parser.
+2. Load it: `set -a; source .env; set +a`.
+3. The bot refuses to start without `TELEGRAM_ALLOWED_CHAT_IDS`, so get your chat
+   id first: send your new bot any message, then (with the bot not running) run
+   `curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/getUpdates"` and copy
+   the `"chat":{"id":...}` number into `TELEGRAM_ALLOWED_CHAT_IDS` in `.env`.
+4. Load `.env` again, then run `python3 -m bizcard_intake setup` (checks gws,
+   codex or claude, telegram and guides the Google login).
+5. Start the bot: `./scripts/start_bot.sh`.
+
+Only listed chats can use the bot; everyone else gets a one-line refusal that
+shows their chat id, so adding more people later is easy.
 
 ### Google login, once
 
@@ -193,7 +200,7 @@ Put the OpenAI API key in `.env` as `OPENAI_API_KEY=`, or point
 `OPENAI_API_KEY` line and never logs it. Without a key the bot uses the codex or
 claude CLI. If an API call
 fails (network, quota, rate limit) the same prompt is retried once with the
-codex CLI, then claude. The image sent to the model is a 1024px copy; the 1600px
+codex CLI (or claude when codex is not installed). The image sent to the model is a 1024px copy; the 1600px
 one is only for Apple Vision OCR. Typed `항목: 값` edits, saving and retries use no
 model at all.
 
@@ -252,11 +259,14 @@ GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file
 
 ## Privacy
 
-Card images and OCR text are sent to the model provider you use: the OpenAI API
-or Codex CLI, and Anthropic (Claude Haiku API for the cross-check, or the Claude
-Code CLI). The parsed fields and card photo go to your Google Contacts. Nothing
-else leaves the machine. Card drafts, logs and images stay in `data/`, which is
-git-ignored; images are deleted after a successful save.
+Card photos arrive through Telegram, and drafts with preview images go back to
+your Telegram chat before you approve them. Card images and OCR text are sent to
+the model provider you use: the OpenAI API or Codex CLI, and Anthropic (Claude
+Haiku API for the cross-check, or the Claude Code CLI). The parsed fields and
+card photo go to your Google Contacts. Nothing else leaves the machine. Card
+records, logs and images stay locally in `data/`, which is git-ignored; the
+local card images are deleted after a successful save (the profile image is kept
+until a failed photo upload succeeds on retry).
 
 ## Tests
 
